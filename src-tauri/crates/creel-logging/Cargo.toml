@@ -1,0 +1,10 @@
+[package]
+name = "creel-logging"
+version = "0.1.0"
+description = "Shared rotating file logging and panic reports for DCreel processes"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+log = { version = "0.4.34", features = ["std"] }
+time = { version = "0.3.55", features = ["formatting"] }

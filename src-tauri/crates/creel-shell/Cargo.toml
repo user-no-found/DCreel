@@ -1,0 +1,23 @@
+[package]
+name = "creel-shell"
+version = "0.1.0"
+description = "Minimal Rust Explorer command extension for DCreel"
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+name = "creel_shell"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+creel-ipc = { path = "../creel-ipc" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_System_LibraryLoader",
+  "Win32_UI_Shell",
+] }
+winreg = "0.56.0"
+windows-core = "0.62.2"

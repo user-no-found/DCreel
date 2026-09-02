@@ -1,0 +1,112 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "DCreel",
+  "version": "0.1.0",
+  "identifier": "com.creel.desktop",
+  "build": {
+    "beforeDevCommand": "npm run tauri:before-dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run tauri:before-build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "DCreel",
+        "width": 1240,
+        "height": 800,
+        "minWidth": 960,
+        "minHeight": 640,
+        "center": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": true,
+        "resizable": true,
+        "fullscreen": false,
+        "skipTaskbar": false,
+        "visible": false,
+        "dragDropEnabled": true
+      },
+      {
+        "label": "splash",
+        "title": "DCreel",
+        "width": 72,
+        "height": 72,
+        "center": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "resizable": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false,
+        "dragDropEnabled": false
+      },
+      {
+        "label": "new-box",
+        "title": "DCreel · 新建盒子",
+        "width": 520,
+        "height": 660,
+        "center": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "resizable": false,
+        "fullscreen": false,
+        "skipTaskbar": true,
+        "visible": false,
+        "dragDropEnabled": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaW5pIHB1YmxpYyBrZXk6IDVFRTE1ODdERkUxMzQ4MzMKUldRelNCUCtmVmpoWG5wdkM5MlJ2MWpPWGIvcTd1MDU5QUtiTE56THVYUUxERy81VFdxZVhobk0K",
+      "endpoints": [
+        "https://github.com/user-no-found/DCreel/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "createUpdaterArtifacts": true,
+    "resources": {
+      "../LICENSE": "LICENSE",
+      "../TRADEMARKS.md": "TRADEMARKS.md",
+      "target/release/creel_shell.dll": "creel_shell.dll",
+      "target/release/creel-desktop-host.exe": "creel-desktop-host.exe"
+    },
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "windows": {
+      "allowDowngrades": false,
+      "webviewInstallMode": {
+        "type": "downloadBootstrapper",
+        "silent": true
+      },
+      "nsis": {
+        "installMode": "currentUser",
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "installerHooks": "windows/installer-hooks.nsh"
+      },
+      "wix": {
+        "language": ["zh-CN", "en-US"]
+      }
+    }
+  }
+}

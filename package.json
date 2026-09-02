@@ -1,0 +1,40 @@
+{
+  "name": "dcreel",
+  "private": true,
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "build:native": "cargo build --manifest-path src-tauri/Cargo.toml -p creel-shell --lib && cargo build --manifest-path src-tauri/Cargo.toml -p creel-desktop-host",
+    "build:native:release": "cargo build --release --manifest-path src-tauri/Cargo.toml -p creel-shell --lib && cargo build --release --manifest-path src-tauri/Cargo.toml -p creel-desktop-host",
+    "build:release": "tauri build --no-bundle",
+    "tauri:before-dev": "npm run build:native && npm run dev",
+    "tauri:before-build": "npm run build:native:release && npm run build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "icons": "node scripts/make-icons.mjs && tauri icon src-tauri/icons/creel-icon.png"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-dialog": "^2.7.3",
+    "@tauri-apps/plugin-process": "2.3.1",
+    "@tauri-apps/plugin-updater": "2.11.0",
+    "lucide-react": "^1.39.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@vitejs/plugin-react": "^6.1.1",
+    "sharp": "^0.35.4",
+    "typescript": "~7.0.2",
+    "vite": "^8.2.2"
+  },
+  "allowScripts": {
+    "sharp@0.35.4": true
+  }
+}

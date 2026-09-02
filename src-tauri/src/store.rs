@@ -1,0 +1,520 @@
+use crate::models::{
+    Dashboard, DesktopItem, FenceConfig, FencePlacement, FenceView, PersistedState, Preferences,
+    state_version,
+};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::{
+        Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::UNIX_EPOCH,
+};
+use tauri::{AppHandle, Manager};
+use thiserror::Error;
+use uuid::Uuid;
+
+#[derive(Debug, Error)]
+pub enum CreelError {
+    #[error("无法读取或写入本地文件：{0}")]
+    Io(#[from] std::io::Error),
+    #[error("配置文件格式无效：{0}")]
+    Json(#[from] serde_json::Error),
+    #[error("没有找到盒子：{0}")]
+    FenceNotFound(String),
+    #[error("DCreel 的内部状态暂时不可用")]
+    StatePoisoned,
+}
+
+pub type CreelResult<T> = Result<T, CreelError>;
+
+pub struct AppStore {
+    pub inner: Mutex<PersistedState>,
+    pub config_path: PathBuf,
+    desktop_visible: AtomicBool,
+}
+
+impl AppStore {
+    pub fn load(app: &AppHandle) -> Result<Self, Box<dyn std::error::Error>> {
+        // 显式覆盖只用于隔离的开发/集成测试；正常启动始终使用系统应用配置目录。
+        let root_dir = std::env::var_os("CREEL_STATE_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or(app.path().app_config_dir()?);
+        fs::create_dir_all(&root_dir)?;
+        let config_path = root_dir.join("state.json");
+        let state = match load_current_state(&config_path)? {
+            Some(state) => state,
+            None => {
+                if config_path.exists() {
+                    fs::remove_file(&config_path)?;
+                }
+                // 新状态不再预设任何桌面文件夹或示例盒子。
+                // 用户在新建收纳盒时自行选择存放位置。
+                let fresh = PersistedState::default();
+                write_state(&config_path, &fresh)?;
+                fresh
+            }
+        };
+
+        Ok(Self {
+            inner: Mutex::new(state),
+            config_path,
+            desktop_visible: AtomicBool::new(true),
+        })
+    }
+
+    pub fn lock(&self) -> CreelResult<MutexGuard<'_, PersistedState>> {
+        self.inner.lock().map_err(|_| CreelError::StatePoisoned)
+    }
+
+    pub fn save(&self, state: &PersistedState) -> CreelResult<()> {
+        write_state(&self.config_path, state)
+    }
+
+    pub fn dashboard(&self) -> CreelResult<Dashboard> {
+        let state = self.lock()?.clone();
+        Ok(dashboard_from_state(&state))
+    }
+
+    pub fn fence_view(&self, fence: &FenceConfig) -> CreelResult<FenceView> {
+        let show_hidden = self.lock()?.preferences.show_hidden_files;
+        Ok(fence_to_view(fence.clone(), show_hidden))
+    }
+
+    pub fn desktop_visible(&self) -> bool {
+        self.desktop_visible.load(Ordering::Relaxed)
+    }
+
+    pub fn set_desktop_visible(&self, visible: bool) {
+        self.desktop_visible.store(visible, Ordering::Relaxed);
+    }
+}
+
+pub fn dashboard_from_state(state: &PersistedState) -> Dashboard {
+    let fences = state
+        .fences
+        .iter()
+        .cloned()
+        .map(|fence| fence_to_view(fence, state.preferences.show_hidden_files))
+        .collect();
+    Dashboard {
+        fences,
+        preferences: state.preferences.clone(),
+        desktop_path: dirs::desktop_dir(),
+    }
+}
+
+fn fence_to_view(config: FenceConfig, show_hidden: bool) -> FenceView {
+    let items = list_directory(&config.directory, show_hidden).unwrap_or_default();
+    FenceView { config, items }
+}
+
+pub fn list_directory(directory: &Path, show_hidden: bool) -> CreelResult<Vec<DesktopItem>> {
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut items = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.eq_ignore_ascii_case("desktop.ini") {
+            continue;
+        }
+        if !show_hidden && is_hidden(&entry.path(), &name) {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let is_dir = metadata.is_dir();
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_millis().min(u64::MAX as u128) as u64);
+        items.push(DesktopItem {
+            name,
+            path: entry.path(),
+            is_dir,
+            extension: if is_dir {
+                None
+            } else {
+                entry
+                    .path()
+                    .extension()
+                    .map(|value| value.to_string_lossy().to_lowercase())
+            },
+            size: (!is_dir).then_some(metadata.len()),
+            modified_at,
+        });
+        if items.len() >= 500 {
+            break;
+        }
+    }
+
+    items.sort_by(|left, right| {
+        right
+            .is_dir
+            .cmp(&left.is_dir)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+    Ok(items)
+}
+
+#[cfg(windows)]
+fn is_hidden(path: &Path, name: &str) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    name.starts_with('.')
+        || fs::metadata(path)
+            .map(|metadata| metadata.file_attributes() & FILE_ATTRIBUTE_HIDDEN != 0)
+            .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn is_hidden(_path: &Path, name: &str) -> bool {
+    name.starts_with('.')
+}
+
+pub fn normalize_preferences(mut preferences: Preferences) -> Preferences {
+    preferences.title_opacity = normalized_opacity(preferences.title_opacity, 0.9);
+    preferences.content_opacity = normalized_opacity(preferences.content_opacity, 0.9);
+    preferences.fence_border_opacity = normalized_opacity(preferences.fence_border_opacity, 0.4);
+    preferences.icon_size = preferences.icon_size.clamp(36, 64);
+    preferences.default_fence_width = bounded_geometry_value(
+        preferences.default_fence_width,
+        244.0,
+        800.0,
+        Preferences::default().default_fence_width,
+    );
+    preferences.default_fence_height = bounded_geometry_value(
+        preferences.default_fence_height,
+        148.0,
+        700.0,
+        Preferences::default().default_fence_height,
+    );
+    preferences.ghost_opacity = if preferences.ghost_opacity.is_finite() {
+        preferences.ghost_opacity.clamp(0.0, 1.0)
+    } else {
+        Preferences::default().ghost_opacity
+    };
+    preferences.ghost_hotkey = preferences.ghost_hotkey.trim().chars().take(64).collect();
+    if preferences.ghost_hotkey.is_empty() {
+        preferences.ghost_hotkey = "Ctrl+Alt+G".into();
+    }
+    preferences
+}
+
+fn normalized_opacity(value: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        fallback
+    }
+}
+
+pub fn normalize_fence(mut fence: FenceConfig) -> FenceConfig {
+    fence.title = fence.title.trim().chars().take(80).collect();
+    if fence.title.is_empty() {
+        fence.title = "未命名盒子".into();
+    }
+    // Windows 虚拟桌面允许副显示器位于主屏左侧或上方，因此坐标可以为负数。
+    fence.x = fence.x.clamp(-32_768.0, 32_768.0);
+    fence.y = fence.y.clamp(-32_768.0, 32_768.0);
+    fence.width = fence.width.clamp(244.0, 1600.0);
+    fence.height = fence.height.clamp(148.0, 1200.0);
+    fence.color = normalize_color_value(&fence.color, "coral", false);
+    fence.content_color = normalize_color_value(&fence.content_color, "paper", true);
+    fence.placement = fence.placement.and_then(normalize_placement);
+    fence
+}
+
+fn normalize_color_value(value: &str, fallback: &str, allow_materials: bool) -> String {
+    let value = value.trim();
+    let named = matches!(
+        value,
+        "coral" | "sage" | "butter" | "sky" | "lilac" | "graphite"
+    ) || allow_materials && matches!(value, "paper" | "frosted");
+    if named {
+        return value.into();
+    }
+    if value.len() == 7
+        && value.starts_with('#')
+        && value[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return value.to_ascii_uppercase();
+    }
+    fallback.into()
+}
+
+fn normalize_placement(mut placement: FencePlacement) -> Option<FencePlacement> {
+    placement.group_id = placement.group_id.trim().chars().take(128).collect();
+    if placement.group_id.is_empty() {
+        return None;
+    }
+    for axis in [&mut placement.horizontal, &mut placement.vertical] {
+        if !axis.value.is_finite() {
+            return None;
+        }
+        axis.value = match axis.anchor {
+            creel_ipc::LayoutAnchor::Start | creel_ipc::LayoutAnchor::End => {
+                axis.value.clamp(0.0, 65_536.0)
+            }
+            creel_ipc::LayoutAnchor::Proportional => axis.value.clamp(0.0, 1.0),
+        };
+    }
+    if !placement.offset_x_dip.is_finite() || !placement.offset_y_dip.is_finite() {
+        return None;
+    }
+    placement.offset_x_dip = placement.offset_x_dip.clamp(0.0, 65_536.0);
+    placement.offset_y_dip = placement.offset_y_dip.clamp(0.0, 65_536.0);
+    Some(placement)
+}
+
+pub fn apply_fence_geometry(
+    fence: &mut FenceConfig,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> bool {
+    let next_x = bounded_geometry_value(x, -32_768.0, 32_768.0, fence.x);
+    let next_y = bounded_geometry_value(y, -32_768.0, 32_768.0, fence.y);
+    let next_width = bounded_geometry_value(width, 244.0, 1_600.0, fence.width);
+    // 收起时原生窗口高度固定为 48px，保留展开时的持久化高度。
+    let next_height = if fence.collapsed {
+        fence.height
+    } else {
+        bounded_geometry_value(height, 148.0, 1_200.0, fence.height)
+    };
+    let changed = fence.x != next_x
+        || fence.y != next_y
+        || fence.width != next_width
+        || fence.height != next_height;
+    fence.x = next_x;
+    fence.y = next_y;
+    fence.width = next_width;
+    fence.height = next_height;
+    changed
+}
+
+fn bounded_geometry_value(value: f64, minimum: f64, maximum: f64, fallback: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(minimum, maximum)
+    } else {
+        fallback
+    }
+}
+
+pub fn next_position(fences: &[FenceConfig], width: f64, height: f64) -> (f64, f64) {
+    let width = width.clamp(244.0, 800.0);
+    let height = height.clamp(148.0, 700.0);
+    let column_step = width + 26.0;
+    let row_step = height + 26.0;
+
+    for index in 0..10_000 {
+        let column = index % 3;
+        let row = index / 3;
+        let x = 34.0 + column as f64 * column_step;
+        let y = 38.0 + row as f64 * row_step;
+        let overlaps = fences.iter().any(|fence| {
+            x < fence.x + fence.width
+                && x + width > fence.x
+                && y < fence.y + fence.height
+                && y + height > fence.y
+        });
+        if !overlaps {
+            return (x, y);
+        }
+    }
+
+    let row = fences.len() / 3;
+    (34.0, 38.0 + row as f64 * row_step)
+}
+
+pub fn safe_directory_name(title: &str) -> String {
+    let name: String = title
+        .trim()
+        .chars()
+        .map(|character| match character {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => ' ',
+            value if value.is_control() => ' ',
+            value => value,
+        })
+        .collect();
+    let name = name.trim().trim_end_matches('.');
+    if name.is_empty() {
+        format!("收纳盒-{}", &Uuid::new_v4().to_string()[..8])
+    } else {
+        name.chars().take(60).collect()
+    }
+}
+
+pub fn unique_directory(parent: &Path, title: &str) -> PathBuf {
+    let base = safe_directory_name(title);
+    let initial = parent.join(&base);
+    if !initial.exists() {
+        return initial;
+    }
+    for index in 2..10_000 {
+        let candidate = parent.join(format!("{base} ({index})"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    parent.join(format!("{base}-{}", Uuid::new_v4()))
+}
+
+pub fn unique_destination(target_dir: &Path, file_name: &str) -> PathBuf {
+    let initial = target_dir.join(file_name);
+    if !initial.exists() {
+        return initial;
+    }
+    let path = Path::new(file_name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("文件");
+    let extension = path.extension().and_then(|value| value.to_str());
+    for index in 2..10_000 {
+        let name = match extension {
+            Some(extension) => format!("{stem} ({index}).{extension}"),
+            None => format!("{stem} ({index})"),
+        };
+        let candidate = target_dir.join(name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    target_dir.join(format!("{stem}-{}", Uuid::new_v4()))
+}
+
+fn load_current_state(path: &Path) -> CreelResult<Option<PersistedState>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read(path)?;
+    let document: serde_json::Value = serde_json::from_slice(&content)?;
+    let is_current = document
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|version| version == u64::from(state_version()));
+    if !is_current {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_slice(&content)?))
+}
+
+fn write_state(path: &Path, state: &PersistedState) -> CreelResult<()> {
+    let bytes = serde_json::to_vec_pretty(state)?;
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn directory_names_drop_windows_reserved_characters() {
+        assert_eq!(safe_directory_name("  项目:A/B?  "), "项目 A B");
+    }
+
+    #[test]
+    fn preferences_are_clamped() {
+        let result = normalize_preferences(Preferences {
+            title_opacity: 4.0,
+            content_opacity: -2.0,
+            fence_border_opacity: f64::NAN,
+            icon_size: 2,
+            ghost_opacity: -3.0,
+            ..Preferences::default()
+        });
+        assert_eq!(result.title_opacity, 1.0);
+        assert_eq!(result.content_opacity, 0.0);
+        assert_eq!(result.fence_border_opacity, 0.4);
+        assert_eq!(result.icon_size, 36);
+        assert_eq!(result.ghost_opacity, 0.0);
+
+        let non_finite = normalize_preferences(Preferences {
+            ghost_opacity: f64::NAN,
+            ..Preferences::default()
+        });
+        assert_eq!(non_finite.ghost_opacity, 0.2);
+    }
+
+    #[test]
+    fn fence_colors_accept_arbitrary_hex_and_content_materials() {
+        assert_eq!(
+            normalize_color_value(" #12abEf ", "coral", false),
+            "#12ABEF"
+        );
+        assert_eq!(normalize_color_value("#0f8342", "paper", true), "#0F8342");
+        assert_eq!(normalize_color_value("paper", "paper", true), "paper");
+        assert_eq!(normalize_color_value("frosted", "paper", true), "frosted");
+        assert_eq!(normalize_color_value("frosted", "coral", false), "coral");
+        assert_eq!(normalize_color_value("#12XZ89", "paper", true), "paper");
+    }
+
+    #[test]
+    fn new_fence_position_skips_occupied_boxes() {
+        let occupied = FenceConfig {
+            id: "occupied".into(),
+            title: "Occupied".into(),
+            directory: PathBuf::from(r"C:\occupied"),
+            x: 34.0,
+            y: 38.0,
+            width: 330.0,
+            height: 280.0,
+            color: "coral".into(),
+            content_color: "paper".into(),
+            collapsed: false,
+            locked: false,
+            display_anchor: None,
+            placement: None,
+        };
+        assert_eq!(next_position(&[], 330.0, 280.0), (34.0, 38.0));
+        assert_eq!(next_position(&[occupied], 330.0, 280.0), (390.0, 38.0));
+    }
+
+    #[test]
+    fn host_geometry_is_clamped_and_collapsed_height_is_preserved() {
+        let mut fence = FenceConfig {
+            id: "geometry-test".into(),
+            title: "几何测试".into(),
+            directory: PathBuf::from(r"C:\geometry-test"),
+            x: 20.0,
+            y: 30.0,
+            width: 330.0,
+            height: 280.0,
+            color: "coral".into(),
+            content_color: "paper".into(),
+            collapsed: true,
+            locked: false,
+            display_anchor: None,
+            placement: None,
+        };
+
+        assert!(apply_fence_geometry(
+            &mut fence, -90_000.0, 90_000.0, 100.0, 48.0
+        ));
+        assert_eq!(fence.x, -32_768.0);
+        assert_eq!(fence.y, 32_768.0);
+        assert_eq!(fence.width, 244.0);
+        assert_eq!(fence.height, 280.0);
+        assert!(!apply_fence_geometry(
+            &mut fence,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            900.0
+        ));
+    }
+}
