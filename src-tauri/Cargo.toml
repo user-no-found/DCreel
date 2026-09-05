@@ -1,6 +1,6 @@
 [package]
 name = "dcreel"
-version = "0.1.0"
+version = "0.1.1"
 description = "DCreel - a calm, local-first desktop organizer"
 authors = ["DCreel contributors"]
 edition = "2024"

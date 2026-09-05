@@ -1,12 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const PROTOCOL_VERSION: u16 = 14;
+pub const PROTOCOL_VERSION: u16 = 15;
 pub const ARG_SHOW: &str = "--show";
 pub const ARG_SILENT: &str = "--silent";
 pub const ARG_NEW_FENCE: &str = "--new-fence";
 pub const ARG_NEW_MAPPED_FENCE: &str = "--new-mapped-fence";
 pub const ARG_TOGGLE_FENCES: &str = "--toggle-fences";
+pub const ARG_QUIT: &str = "--quit";
 pub const ARG_MAP_FOLDER: &str = "--map-folder";
 pub const EXPLORER_COMMAND_CLSID_TEXT: &str = "{7C998A5B-2F68-4A76-9C88-7209A70F4CA0}";
 pub const EXPLORER_COMMAND_CANONICAL_GUID_TEXT: &str = "{06E8DE01-87AE-4DB7-A685-E8E87F5F8F8B}";
@@ -19,6 +20,7 @@ pub enum ExternalCommand {
     NewStorageBox,
     NewMappedBox,
     ToggleFences,
+    Quit,
     MapFolder(PathBuf),
 }
 
@@ -32,6 +34,7 @@ pub fn parse_external_commands(args: &[String]) -> Vec<ExternalCommand> {
             ARG_NEW_FENCE => commands.push(ExternalCommand::NewStorageBox),
             ARG_NEW_MAPPED_FENCE => commands.push(ExternalCommand::NewMappedBox),
             ARG_TOGGLE_FENCES => commands.push(ExternalCommand::ToggleFences),
+            ARG_QUIT => commands.push(ExternalCommand::Quit),
             ARG_MAP_FOLDER => {
                 if let Some(path) = args.get(index + 1) {
                     commands.push(ExternalCommand::MapFolder(PathBuf::from(path)));
@@ -171,6 +174,7 @@ pub enum HostUserAction {
     SetFenceColor { id: String, color: String },
     ResetFenceSize { id: String },
     RemoveFence { id: String },
+    QuitApplication,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -201,6 +205,9 @@ pub enum HostEvent {
     },
     Notification {
         message: String,
+    },
+    DesktopVisibilityChanged {
+        visible: bool,
     },
     Error {
         message: String,
@@ -246,6 +253,14 @@ mod tests {
         assert_eq!(
             parse_external_commands(&[ARG_NEW_MAPPED_FENCE.into()]),
             vec![ExternalCommand::NewMappedBox]
+        );
+    }
+
+    #[test]
+    fn parser_accepts_explicit_quit_without_showing_the_window() {
+        assert_eq!(
+            parse_external_commands(&[ARG_QUIT.into()]),
+            vec![ExternalCommand::Quit]
         );
     }
 
@@ -337,6 +352,15 @@ mod tests {
         let line = message_line(&event).unwrap();
         let decoded = serde_json::from_str::<HostEvent>(line.trim())
             .expect("notification should deserialize");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn host_visibility_event_round_trips() {
+        let event = HostEvent::DesktopVisibilityChanged { visible: false };
+        let line = message_line(&event).unwrap();
+        let decoded = serde_json::from_str::<HostEvent>(line.trim())
+            .expect("visibility event should deserialize");
         assert_eq!(decoded, event);
     }
 

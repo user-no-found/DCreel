@@ -125,6 +125,13 @@ fn set_enabled_for_executable(
         &icon,
         &command_line(&executable, "--toggle-fences"),
     )?;
+    write_verb(
+        &menu,
+        "shell\\05quit",
+        "退出 DCreel",
+        &icon,
+        &command_line(&executable, creel_ipc::ARG_QUIT),
+    )?;
     Ok(())
 }
 
@@ -183,6 +190,10 @@ mod tests {
         assert_eq!(
             super::command_line(r"C:\Program Files\DCreel\dcreel.exe", "--show"),
             r#""C:\Program Files\DCreel\dcreel.exe" --show"#
+        );
+        assert_eq!(
+            super::command_line(r"C:\Program Files\DCreel\dcreel.exe", creel_ipc::ARG_QUIT),
+            r#""C:\Program Files\DCreel\dcreel.exe" --quit"#
         );
     }
 }

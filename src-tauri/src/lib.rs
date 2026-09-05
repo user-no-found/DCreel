@@ -60,6 +60,17 @@ fn shutdown_desktop_integration(app: &tauri::AppHandle) {
     }
 }
 
+pub(crate) fn quit_application(app: &tauri::AppHandle) {
+    log::info!(target: "shutdown", "explicit quit command received");
+    shutdown_desktop_integration(app);
+    app.exit(0);
+}
+
+#[tauri::command]
+fn quit_app(app: tauri::AppHandle) {
+    quit_application(&app);
+}
+
 fn request_desktop_sync(app: &tauri::AppHandle) {
     if let Some(host) = app.try_state::<desktop_host::DesktopHostController>() {
         host.request_sync();
@@ -71,7 +82,6 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
     let new_fence = MenuItem::with_id(app, "new-fence", "新建收纳盒", true, None::<&str>)?;
     let new_mapped =
         MenuItem::with_id(app, "new-mapped-fence", "新建映射盒子", true, None::<&str>)?;
-    let organize = MenuItem::with_id(app, "organize", "打开快速整理", true, None::<&str>)?;
     let toggle_fences = MenuItem::with_id(
         app,
         "toggle-fences",
@@ -82,14 +92,7 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
-        &[
-            &show,
-            &new_fence,
-            &new_mapped,
-            &organize,
-            &toggle_fences,
-            &quit,
-        ],
+        &[&show, &new_fence, &new_mapped, &toggle_fences, &quit],
     )?;
 
     let mut tray = TrayIconBuilder::with_id("creel-tray")
@@ -97,20 +100,14 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "show" | "organize" => {
-                request_main_window(app);
-                if event.id.as_ref() == "organize" {
-                    let _ = app.emit("creel://navigate", "organize");
-                }
-            }
+            "show" => request_main_window(app),
             "toggle-fences" => {
                 let _ = desktop_windows::toggle_visibility(app);
             }
             "new-fence" => request_storage_box_ui(app),
             "new-mapped-fence" => request_mapped_fence_ui(app),
             "quit" => {
-                shutdown_desktop_integration(app);
-                app.exit(0);
+                quit_application(app);
             }
             _ => {}
         })
@@ -229,6 +226,10 @@ fn handle_external_args(app: &tauri::AppHandle, args: &[String]) {
                 if let Err(error) = desktop_windows::toggle_visibility(app) {
                     let _ = app.emit("creel://notification", error);
                 }
+            }
+            ExternalCommand::Quit => {
+                quit_application(app);
+                return;
             }
             ExternalCommand::MapFolder(path) => {
                 let store = app.state::<AppStore>();
@@ -357,14 +358,12 @@ pub fn run() {
             commands::open_path,
             commands::open_project_repository,
             commands::set_hotkey_capture_active,
-            commands::reveal_path,
-            commands::preview_desktop_sweep,
-            commands::organize_desktop,
             diagnostics::write_frontend_log,
             diagnostics::open_log_directory,
             complete_startup,
             backend_ready,
             take_pending_navigation,
+            quit_app,
         ]);
 
     let app = match builder.build(tauri::generate_context!()) {

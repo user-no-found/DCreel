@@ -601,7 +601,7 @@ dependencies = [
 
 [[package]]
 name = "creel-desktop-host"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "creel-ipc",
  "creel-logging",
@@ -614,7 +614,7 @@ dependencies = [
 
 [[package]]
 name = "creel-ipc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "creel-logging"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "log",
  "time",
@@ -630,7 +630,7 @@ dependencies = [
 
 [[package]]
 name = "creel-shell"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "creel-ipc",
  "windows 0.62.2",
@@ -749,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "dcreel"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "creel-ipc",
  "creel-logging",

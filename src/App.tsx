@@ -9,7 +9,6 @@ import {
 } from "react";
 import {
   AppWindow,
-  Archive,
   Boxes,
   Check,
   ChevronDown,
@@ -18,26 +17,21 @@ import {
   CircleHelp,
   Copy,
   Download,
-  FileArchive,
-  FileCode2,
-  FileImage,
-  FileText,
   FolderInput,
   FolderOpen,
   Eye,
   EyeOff,
   ExternalLink,
-  Image,
   Inbox,
   GitFork,
   LayoutGrid,
   Link2,
   Lock,
   Minus,
-  Music2,
   MonitorUp,
   Palette,
   Pencil,
+  Power,
   Plus,
   RefreshCw,
   Search,
@@ -47,7 +41,6 @@ import {
   Square,
   Trash2,
   Unlock,
-  WandSparkles,
   X
 } from "lucide-react";
 import { getVersion } from "@tauri-apps/api/app";
@@ -60,14 +53,13 @@ import {
   createStorageBox,
   completeStartup,
   deleteFence,
-  getSweepPreview,
   isTauri,
   loadDashboard,
   openItem,
   openLogDirectory,
   openProjectRepository,
   PROJECT_REPOSITORY_URL,
-  runSweep,
+  quitApplication,
   saveFence,
   savePreferences,
   setDesktopVisibility,
@@ -77,15 +69,11 @@ import {
   writeFrontendLog
 } from "./lib/bridge";
 import { basename, formatBytes } from "./lib/format";
-import type {
-  Dashboard,
-  Fence,
-  Preferences,
-  SweepPreview
-} from "./types";
+import { clearMatchingPatch, mergeDashboardWithOptimistic } from "./lib/stateSync";
+import type { Dashboard, Fence, FencePatch, Preferences } from "./types";
 
-type View = "desktop" | "organize" | "settings" | "about";
-type Modal = "new" | "sweep" | null;
+type View = "desktop" | "settings" | "about";
+type Modal = "new" | null;
 type NewFenceKind = "storage" | "mapped";
 type UpdaterPhase =
   | "idle"
@@ -130,23 +118,11 @@ function resolvedColor(value: string): string {
 function customColorValue(value: string, fallback: string): string {
   return /^#[0-9a-f]{6}$/i.test(value) ? value : resolvedColor(value || fallback);
 }
-const extensionGroups: Record<string, string[]> = {
-  图片素材: ["png", "jpg", "jpeg", "gif", "webp", "svg", "psd", "ai"],
-  文档资料: ["pdf", "doc", "docx", "txt", "md", "xls", "xlsx", "ppt", "pptx"],
-  音视频: ["mp3", "wav", "flac", "mp4", "mov", "mkv", "avi"],
-  压缩包: ["zip", "rar", "7z", "tar", "gz"],
-  代码文件: ["rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "json", "toml"]
-};
 const viewMeta: Record<View, { eyebrow: string; title: string; summary: string }> = {
   desktop: {
     eyebrow: "DESKTOP BOXES",
     title: "桌面盒子",
     summary: "在桌面上查看和整理你选择的本地文件夹"
-  },
-  organize: {
-    eyebrow: "QUICK TIDY",
-    title: "快速整理",
-    summary: "先预览，再把桌面普通文件移入真实分类文件夹"
   },
   settings: {
     eyebrow: "PREFERENCES",
@@ -189,22 +165,31 @@ function DCreelApp() {
   const [newColor, setNewColor] = useState("coral");
   const [newContentColor, setNewContentColor] = useState("paper");
   const [newDirectory, setNewDirectory] = useState<string | undefined>();
-  const [sweep, setSweep] = useState<SweepPreview | null>(null);
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
-  const [desktopVisible, setDesktopVisibleState] = useState(true);
   const [windowMaximized, setWindowMaximized] = useState(false);
-  const [appVersion, setAppVersion] = useState("0.1.0");
+  const [appVersion, setAppVersion] = useState("0.1.1");
   const [updater, setUpdater] = useState<UpdaterState>(initialUpdaterState);
   const dashboardRef = useRef<Dashboard | null>(null);
   const availableUpdateRef = useRef<Update | null>(null);
   const autoUpdateStarted = useRef(false);
   const preferenceTimer = useRef<number | undefined>(undefined);
   const folderRefreshTimer = useRef<number | undefined>(undefined);
+  const preferenceBufferedRef = useRef<Partial<Preferences>>({});
+  const preferenceOptimisticRef = useRef<Partial<Preferences>>({});
+  const preferenceSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const fenceOptimisticRef = useRef<Map<string, FencePatch>>(new Map());
+  const fenceSaveQueuesRef = useRef<Map<string, Promise<void>>>(new Map());
 
   const refresh = useCallback(async () => {
     try {
-      const next = await loadDashboard();
+      const loaded = await loadDashboard();
+      const next = mergeDashboardWithOptimistic(
+        loaded,
+        preferenceOptimisticRef.current,
+        fenceOptimisticRef.current
+      );
+      dashboardRef.current = next;
       setDashboard(next);
       setLoadError(null);
       return true;
@@ -372,6 +357,7 @@ function DCreelApp() {
   }, [isNewBoxWindow]);
 
   const dashboardReady = dashboard !== null;
+  const desktopVisible = dashboard?.desktopVisible ?? true;
 
   useEffect(() => {
     if (!dashboardReady || isNewBoxWindow || autoUpdateStarted.current || !isTauri()) return;
@@ -442,9 +428,7 @@ function DCreelApp() {
       });
     }
     const navigate = (payload: string | null) => {
-      if (payload === "organize") {
-        setView("organize");
-      } else if (payload === "new-storage-box") {
+      if (payload === "new-storage-box") {
         setView("desktop");
         setNewKind("storage");
         setNewTitle("");
@@ -495,13 +479,6 @@ function DCreelApp() {
     };
   }, [isNewBoxWindow, refresh]);
 
-  useEffect(
-    () => () => {
-      window.clearTimeout(preferenceTimer.current);
-    },
-    []
-  );
-
   useEffect(() => {
     dashboardRef.current = dashboard;
   }, [dashboard]);
@@ -512,7 +489,7 @@ function DCreelApp() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
-  const mutateFence = async (id: string, patch: Partial<Fence>) => {
+  const mutateFence = async (id: string, patch: FencePatch) => {
     const dashboard = dashboardRef.current;
     if (!dashboard) return;
     const current = dashboard.fences.find((fence) => fence.id === id);
@@ -524,11 +501,45 @@ function DCreelApp() {
     };
     dashboardRef.current = next;
     setDashboard(next);
+    fenceOptimisticRef.current.set(id, {
+      ...(fenceOptimisticRef.current.get(id) ?? {}),
+      ...patch
+    });
+
+    const previousSave = fenceSaveQueuesRef.current.get(id) ?? Promise.resolve();
+    const save = previousSave
+      .catch(() => undefined)
+      .then(async () => {
+        await saveFence(id, patch);
+        const optimistic = fenceOptimisticRef.current.get(id);
+        if (optimistic) {
+          const remaining = clearMatchingPatch(optimistic, patch);
+          if (Object.keys(remaining).length) {
+            fenceOptimisticRef.current.set(id, remaining);
+          } else {
+            fenceOptimisticRef.current.delete(id);
+          }
+        }
+      });
+    fenceSaveQueuesRef.current.set(id, save);
     try {
-      await saveFence(updated);
+      await save;
     } catch (error) {
+      const optimistic = fenceOptimisticRef.current.get(id);
+      if (optimistic) {
+        const remaining = clearMatchingPatch(optimistic, patch);
+        if (Object.keys(remaining).length) {
+          fenceOptimisticRef.current.set(id, remaining);
+        } else {
+          fenceOptimisticRef.current.delete(id);
+        }
+      }
       setToast(errorMessage(error));
       void refresh();
+    } finally {
+      if (fenceSaveQueuesRef.current.get(id) === save) {
+        fenceSaveQueuesRef.current.delete(id);
+      }
     }
   };
 
@@ -540,8 +551,13 @@ function DCreelApp() {
   const showActualDesktop = async () => {
     try {
       if (!desktopVisible) {
-        await setDesktopVisibility(true);
-        setDesktopVisibleState(true);
+        const visible = await setDesktopVisibility(true);
+        setDashboard((state) => {
+          if (!state) return state;
+          const updated = { ...state, desktopVisible: visible };
+          dashboardRef.current = updated;
+          return updated;
+        });
       }
       await getCurrentWindow().minimize();
     } catch (error) {
@@ -599,36 +615,14 @@ function DCreelApp() {
       };
       const fence =
         newKind === "storage" ? await createStorageBox(input) : await createMappedBox(input);
-      setDashboard((state) =>
-        state ? { ...state, fences: [...state.fences, fence] } : state
-      );
+      setDashboard((state) => {
+        if (!state) return state;
+        const updated = { ...state, fences: [...state.fences, fence] };
+        dashboardRef.current = updated;
+        return updated;
+      });
       dismissNewFence();
       setToast(newKind === "storage" ? "收纳盒已创建并映射到桌面" : "映射盒子已创建");
-    } catch (error) {
-      setToast(errorMessage(error));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const showSweep = async () => {
-    setModal("sweep");
-    setSweep(null);
-    try {
-      setSweep(await getSweepPreview());
-    } catch (error) {
-      setToast(errorMessage(error));
-      setModal(null);
-    }
-  };
-
-  const executeSweep = async () => {
-    setBusy(true);
-    try {
-      const next = await runSweep();
-      setDashboard(next);
-      setModal(null);
-      setToast("桌面普通文件已移入对应的真实分类文件夹");
     } catch (error) {
       setToast(errorMessage(error));
     } finally {
@@ -639,19 +633,60 @@ function DCreelApp() {
   const remove = async (fence: Fence) => {
     if (!window.confirm(`移除「${fence.title}」？磁盘里的文件不会被删除。`)) return;
     try {
+      await fenceSaveQueuesRef.current.get(fence.id)?.catch(() => undefined);
       await deleteFence(fence.id);
-      setDashboard((state) =>
-        state
-          ? { ...state, fences: state.fences.filter(({ id }) => id !== fence.id) }
-          : state
-      );
+      fenceOptimisticRef.current.delete(fence.id);
+      setDashboard((state) => {
+        if (!state) return state;
+        const updated = {
+          ...state,
+          fences: state.fences.filter(({ id }) => id !== fence.id)
+        };
+        dashboardRef.current = updated;
+        return updated;
+      });
       setToast("盒子显示已移除；真实文件夹和其中内容仍然保留");
     } catch (error) {
       setToast(errorMessage(error));
     }
   };
 
-  const updatePreference = async <K extends keyof Preferences>(
+  const enqueuePreferenceSave = (patch: Partial<Preferences>) => {
+    const save = preferenceSaveQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        const saved = await savePreferences(patch);
+        const optimistic = preferenceOptimisticRef.current;
+        const remaining = clearMatchingPatch(optimistic, patch);
+        preferenceOptimisticRef.current = remaining;
+        setDashboard((state) => {
+          if (!state) return state;
+          const updated = {
+            ...state,
+            preferences: { ...saved, ...remaining }
+          };
+          dashboardRef.current = updated;
+          return updated;
+        });
+      });
+    preferenceSaveQueueRef.current = save.catch((error) => {
+      const optimistic = preferenceOptimisticRef.current;
+      const remaining = clearMatchingPatch(optimistic, patch);
+      preferenceOptimisticRef.current = remaining;
+      setToast(`设置没有保存：${errorMessage(error)}`);
+      void refresh();
+    });
+  };
+
+  const flushPreferenceChanges = () => {
+    window.clearTimeout(preferenceTimer.current);
+    preferenceTimer.current = undefined;
+    const patch = preferenceBufferedRef.current;
+    preferenceBufferedRef.current = {};
+    if (Object.keys(patch).length) enqueuePreferenceSave(patch);
+  };
+
+  const updatePreference = <K extends keyof Preferences>(
     key: K,
     value: Preferences[K]
   ) => {
@@ -661,26 +696,22 @@ function DCreelApp() {
     const next = { ...current, preferences };
     dashboardRef.current = next;
     setDashboard(next);
+    preferenceBufferedRef.current = { ...preferenceBufferedRef.current, [key]: value };
+    preferenceOptimisticRef.current = { ...preferenceOptimisticRef.current, [key]: value };
     window.clearTimeout(preferenceTimer.current);
-    preferenceTimer.current = window.setTimeout(async () => {
-      try {
-        const saved = await savePreferences(preferences);
-        setDashboard((state) => {
-          if (!state) return state;
-          const updated = { ...state, preferences: saved };
-          dashboardRef.current = updated;
-          return updated;
-        });
-      } catch (error) {
-        setToast(`设置没有保存：${errorMessage(error)}`);
-        void refresh();
-      }
-    }, 220);
+    preferenceTimer.current = window.setTimeout(flushPreferenceChanges, 220);
   };
+
+  useEffect(
+    () => () => {
+      flushPreferenceChanges();
+    },
+    []
+  );
 
   const filteredCount = useMemo(() => {
     if (!dashboard) return 0;
-    return dashboard.fences.reduce((sum, fence) => sum + fence.items.length, 0);
+    return dashboard.fences.reduce((sum, fence) => sum + fence.itemCount, 0);
   }, [dashboard]);
 
   if (!dashboard) {
@@ -746,14 +777,6 @@ function DCreelApp() {
               <span>盒子</span>
             </button>
             <button
-              className={view === "organize" ? "active" : ""}
-              onClick={() => setView("organize")}
-              title="快速整理"
-            >
-              <WandSparkles />
-              <span>整理</span>
-            </button>
-            <button
               className={view === "settings" ? "active" : ""}
               onClick={() => setView("settings")}
               title="设置"
@@ -808,18 +831,20 @@ function DCreelApp() {
                   onClick={() => {
                     const visible = !desktopVisible;
                     void setDesktopVisibility(visible)
-                      .then(() => {
-                        setDesktopVisibleState(visible);
-                        setToast(visible ? "桌面盒子已显示" : "桌面盒子已暂时隐藏");
+                      .then((actualVisible) => {
+                        setDashboard((state) => {
+                          if (!state) return state;
+                          const updated = { ...state, desktopVisible: actualVisible };
+                          dashboardRef.current = updated;
+                          return updated;
+                        });
+                        setToast(actualVisible ? "桌面盒子已显示" : "桌面盒子已暂时隐藏");
                       })
                       .catch((error) => setToast(errorMessage(error)));
                   }}
                   title={desktopVisible ? "暂时隐藏桌面盒子" : "显示桌面盒子"}
                 >
                   {desktopVisible ? <Eye /> : <EyeOff />}
-                </button>
-                <button className="button secondary" onClick={() => void showSweep()}>
-                  <Sparkles /> 快速整理
                 </button>
                 <div className="add-menu">
                   <button className="button primary" onClick={() => showNewFence("storage")}>
@@ -854,15 +879,23 @@ function DCreelApp() {
             />
           )}
 
-          {view === "organize" && (
-            <OrganizeView onPreview={() => void showSweep()} desktopPath={dashboard.desktopPath} />
-          )}
-
           {view === "settings" && (
             <SettingsView
               preferences={dashboard.preferences}
               onChange={updatePreference}
               onError={(error) => setToast(errorMessage(error))}
+              onQuit={() => {
+                flushPreferenceChanges();
+                if (window.confirm("确定要彻底退出 DCreel 吗？文件夹和文件不会删除。")) {
+                  const pendingSaves = [
+                    preferenceSaveQueueRef.current,
+                    ...fenceSaveQueuesRef.current.values()
+                  ];
+                  void Promise.allSettled(pendingSaves)
+                    .then(() => quitApplication())
+                    .catch((error) => setToast(`无法退出 DCreel：${errorMessage(error)}`));
+                }
+              }}
             />
           )}
 
@@ -939,49 +972,6 @@ function DCreelApp() {
         </div>
       )}
 
-      {modal === "sweep" && (
-        <div className="modal-backdrop" onMouseDown={() => setModal(null)}>
-          <div className="modal-card sweep-modal" onMouseDown={(event) => event.stopPropagation()}>
-            <button className="modal-close" onClick={() => setModal(null)}><X /></button>
-            <div className="modal-icon coral"><WandSparkles /></div>
-            <p className="eyebrow">DESKTOP PREVIEW</p>
-            <h2>快速整理桌面</h2>
-            {!sweep ? (
-              <div className="sweep-loading"><RefreshCw className="spin" /> 正在查看桌面文件…</div>
-            ) : sweep.total === 0 ? (
-              <div className="sweep-empty"><Check /> 桌面已经很整洁，没有需要移动的文件。</div>
-            ) : (
-              <>
-                <p className="modal-copy">
-                  将把下面 <b>{sweep.total}</b> 个普通文件移入桌面上的真实分类文件夹；现有文件夹不会被移动。
-                </p>
-                <div className="sweep-groups">
-                  {sweep.groups.map((group) => (
-                    <div key={group.key}>
-                      <span className={`group-icon ${group.key}`}><Archive /></span>
-                      <span><b>{group.label}</b><small>{formatBytes(group.bytes)}</small></span>
-                      <strong>{group.count}</strong>
-                    </div>
-                  ))}
-                </div>
-                <div className="safety-note"><ShieldCheck /> 执行前仅做预览；同名文件会自动添加序号，不会覆盖。</div>
-              </>
-            )}
-            <div className="modal-actions">
-              <button className="button ghost" onClick={() => setModal(null)}>暂不整理</button>
-              <button
-                className="button primary"
-                disabled={!sweep?.total || busy}
-                onClick={() => void executeSweep()}
-              >
-                {busy ? <RefreshCw className="spin" /> : <Sparkles />}
-                确认整理
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {toast && <div className="toast"><Check /> {toast}</div>}
     </div>
   );
@@ -994,7 +984,7 @@ interface FenceManagerProps {
   onShowDesktop: () => void;
   onOpen: (path: string) => void;
   onRename: (fence: Fence) => void;
-  onPatch: (fence: Fence, patch: Partial<Fence>) => void;
+  onPatch: (fence: Fence, patch: FencePatch) => void;
   onDelete: (fence: Fence) => void;
   onNew: () => void;
 }
@@ -1053,7 +1043,7 @@ function FenceManagerView({
                   <h3>{fence.title}</h3>
                   {fence.locked && <Lock />}
                 </div>
-                <p>文件夹映射 · {fence.items.length} 个项目</p>
+                <p>文件夹映射 · {fence.itemCount} 个项目</p>
                 <span title={fence.directory}>{fence.directory}</span>
               </div>
               <div className="manager-card-actions">
@@ -1169,52 +1159,14 @@ function AppearanceColorPicker({
   );
 }
 
-function OrganizeView({ onPreview, desktopPath }: { onPreview: () => void; desktopPath: string | null }) {
-  return (
-    <section className="content-page organize-page">
-      <div className="hero-card">
-        <div>
-          <span className="hero-kicker"><Sparkles /> 先看清，再收进鱼篓</span>
-          <h2>把散落的文件，收进桌面鱼篓。</h2>
-          <p>DCreel 只移动桌面上的普通文件；现有文件夹不会被移动，同名文件也不会被覆盖。</p>
-          <button className="button primary" onClick={onPreview}><WandSparkles /> 扫描并预览</button>
-        </div>
-        <div className="hero-basket">
-          <Inbox />
-          <span className="paper one"><Image /></span>
-          <span className="paper two"><FileText /></span>
-          <span className="paper three"><FileArchive /></span>
-        </div>
-      </div>
-      <div className="section-heading">
-        <div><p className="eyebrow">DEFAULT RULES</p><h2>默认归类规则</h2></div>
-        <span>{desktopPath ? `来源：${desktopPath}` : "未找到系统桌面目录"}</span>
-      </div>
-      <div className="rules-grid">
-        {Object.entries(extensionGroups).map(([name, extensions], index) => {
-          const icons = [<FileImage />, <FileText />, <Music2 />, <FileArchive />, <FileCode2 />];
-          return (
-            <article key={name}>
-              <span className={`rule-icon rule-${index}`}>{icons[index]}</span>
-              <h3>{name}</h3>
-              <p>{extensions.map((extension) => `.${extension}`).join("  ")}</p>
-              <span className="rule-target"><ChevronRight /> 分类文件夹盒子 / {name}</span>
-            </article>
-          );
-        })}
-      </div>
-      <div className="local-note"><ShieldCheck /><div><b>完全本地</b><span>扫描、分类和移动都在本机完成，DCreel 不连接云端。</span></div></div>
-    </section>
-  );
-}
-
 interface SettingsViewProps {
   preferences: Preferences;
   onChange: <K extends keyof Preferences>(key: K, value: Preferences[K]) => void;
   onError: (error: unknown) => void;
+  onQuit: () => void;
 }
 
-function SettingsView({ preferences, onChange, onError }: SettingsViewProps) {
+function SettingsView({ preferences, onChange, onError, onQuit }: SettingsViewProps) {
   return (
     <section className="content-page settings-page">
       <div className="settings-column">
@@ -1314,7 +1266,7 @@ function SettingsView({ preferences, onChange, onError }: SettingsViewProps) {
           )}
           {preferences.ghostMode && preferences.ghostModeTrigger === "hotkey" && (
             <label className="setting-row hotkey-row">
-              <div><b>显隐快捷键</b><span>按住全部按键后松开保存；支持 Z+X，单独输入组合中的按键仍可正常使用</span></div>
+              <div><b>显隐快捷键</b><span>按住全部按键后松开保存；Z+X 等普通键组合不会拦截输入，触发时当前软件也会收到这些按键</span></div>
               <HotkeyInput
                 value={preferences.ghostHotkey}
                 onChange={(value) => onChange("ghostHotkey", value)}
@@ -1330,9 +1282,13 @@ function SettingsView({ preferences, onChange, onError }: SettingsViewProps) {
         <div className="settings-section-title"><Settings /><div><h2>系统</h2><p>启动与桌面集成</p></div></div>
         <div className="settings-card">
           <SettingSwitch title="开机自动启动" detail="登录 Windows 后在托盘中运行 DCreel" checked={preferences.startOnBoot} onChange={(value) => onChange("startOnBoot", value)} />
-          <SettingSwitch title="隐藏托盘图标" detail="隐藏 Windows 通知区域中的 DCreel 图标；仍可通过桌面右键菜单打开" checked={!preferences.showTrayIcon} onChange={(value) => onChange("showTrayIcon", !value)} />
+          <SettingSwitch title="隐藏托盘图标" detail="隐藏 Windows 通知区域中的 DCreel 图标；仍可通过桌面右键菜单打开或彻底退出" checked={!preferences.showTrayIcon} onChange={(value) => onChange("showTrayIcon", !value)} />
           <SettingSwitch title="桌面常驻盒子" detail="把已映射的文件夹以可交互盒子显示在桌面层；关闭后隐藏所有盒子，原文件夹不受影响" checked={preferences.desktopMode} onChange={(value) => onChange("desktopMode", value)} />
-          <SettingSwitch title="桌面右键菜单" detail="在桌面经典右键菜单中加入打开 DCreel、新建盒子和显隐命令" checked={preferences.desktopContextMenu} onChange={(value) => onChange("desktopContextMenu", value)} />
+          <SettingSwitch title="桌面右键菜单" detail="在桌面经典右键菜单中加入打开、新建、显隐和彻底退出 DCreel" checked={preferences.desktopContextMenu} onChange={(value) => onChange("desktopContextMenu", value)} />
+          <div className="setting-row">
+            <div><b>彻底退出 DCreel</b><span>关闭主程序、桌面盒子和后台 Host；不会删除任何文件</span></div>
+            <button type="button" className="button secondary" onClick={onQuit}><Power /> 退出 DCreel</button>
+          </div>
         </div>
       </div>
     </section>
@@ -1480,7 +1436,7 @@ function AboutView({
         <article><FolderOpen /><div><b>文件夹映射</b><span>桌面盒子直接对应你选择的本地目录，资源管理器和上传文件窗口都能正常找到。</span></div></article>
         <article><EyeOff /><div><b>想藏就藏</b><span>自动淡化或全局快捷键显隐，让快乐和不开心按需要退场。</span></div></article>
         <article><MonitorUp /><div><b>留在桌面层</b><span>盒子属于桌面，不会覆盖正在使用的普通应用窗口。</span></div></article>
-        <article><ShieldCheck /><div><b>完全本地</b><span>布局、扫描、分类和文件操作都在本机完成，不依赖云端服务。</span></div></article>
+        <article><ShieldCheck /><div><b>完全本地</b><span>布局与文件操作都在本机完成，不依赖云端服务。</span></div></article>
       </div>
     </section>
   );

@@ -152,6 +152,7 @@ const FENCE_MENU_NEW_MAPPED: usize = 108;
 const FENCE_MENU_RESET_SIZE: usize = 109;
 const FENCE_MENU_COLOR_FIRST: usize = 110;
 const FENCE_MENU_REMOVE: usize = 120;
+const FENCE_MENU_QUIT: usize = 121;
 const RENAME_DIALOG_OK: u16 = 1;
 const RENAME_DIALOG_CANCEL: u16 = 2;
 
@@ -175,7 +176,6 @@ struct ControllerState {
     windows: HashMap<String, HWND>,
     handshake_complete: bool,
     desktop_visible: bool,
-    hotkey_hidden: bool,
     hotkey_chord: Option<HotkeyChord>,
     keyboard_hook: Option<HHOOK>,
     instance: HINSTANCE,
@@ -1677,7 +1677,7 @@ struct GridMetrics {
 #[derive(Default)]
 struct DesktopHosts {
     progman: Option<HWND>,
-    worker: Option<HWND>,
+    workers: Vec<HWND>,
 }
 
 pub fn run() -> Result<(), String> {
@@ -1744,7 +1744,6 @@ pub fn run() -> Result<(), String> {
         windows: HashMap::new(),
         handshake_complete: false,
         desktop_visible: false,
-        hotkey_hidden: false,
         hotkey_chord: None,
         keyboard_hook: None,
         instance,
@@ -2115,7 +2114,6 @@ unsafe fn reconcile_live_display_layout(controller_window: HWND) {
         state_mut(controller_window),
         Some(WindowState::Controller(ControllerState {
             desktop_visible: true,
-            hotkey_hidden: false,
             ..
         }))
     );
@@ -2255,7 +2253,8 @@ unsafe fn sync_fences(
     preferences: HostPreferencesSnapshot,
     visible: bool,
 ) -> Result<usize, String> {
-    let visible = configure_ghost_hotkey(controller_window, &preferences, visible)?;
+    let visible = configure_ghost_hotkey(controller_window, &preferences, visible)
+        .map_err(|error| format!("配置幽灵模式快捷键失败：{error}"))?;
     let displays = available_display_anchors();
     let (fences, layout_events) =
         reconcile_display_layout(fences, &displays, preferences.show_fence_titles);
@@ -2277,6 +2276,7 @@ unsafe fn sync_fences(
     }
 
     for snapshot in fences {
+        let fence_context = format!("盒子「{}」({})", snapshot.title, snapshot.id);
         let existing = match state_mut(controller_window) {
             Some(WindowState::Controller(controller)) => {
                 controller.windows.get(&snapshot.id).copied()
@@ -2284,8 +2284,11 @@ unsafe fn sync_fences(
             _ => None,
         };
         let window = if let Some(window) = existing {
-            if update_fence_window(window, snapshot, preferences.clone(), visible)? {
-                place_fence_layers(window)?;
+            if update_fence_window(window, snapshot, preferences.clone(), visible)
+                .map_err(|error| format!("更新{fence_context}窗口失败：{error}"))?
+            {
+                place_fence_layers(window)
+                    .map_err(|error| format!("设置{fence_context}桌面层级失败：{error}"))?;
             }
             window
         } else {
@@ -2294,7 +2297,8 @@ unsafe fn sync_fences(
                 snapshot.clone(),
                 preferences.clone(),
                 visible,
-            )?;
+            )
+            .map_err(|error| format!("创建{fence_context}窗口失败：{error}"))?;
             if let Some(WindowState::Controller(controller)) = state_mut(controller_window) {
                 controller.windows.insert(snapshot.id, window);
             }
@@ -2339,6 +2343,32 @@ impl HotkeyChordTracker {
         let Some(chord) = self.chord.clone() else {
             return HotkeyHookResult::default();
         };
+        // 纯普通键组合（例如 Z+X）只观察按键状态，不拦截也不使用
+        // SendInput 回放。快捷键触发时前台程序仍能收到原始按键，正常输入
+        // 不会再出现延迟、丢字或因完整性级别不同而回放失败。
+        if chord.keys.iter().all(|key| !is_hotkey_modifier(*key)) {
+            if !chord.keys.contains(&virtual_key) {
+                return HotkeyHookResult::default();
+            }
+            if event.key_down {
+                let first_press = self.pressed.insert(virtual_key);
+                let trigger = first_press
+                    && !self.latched
+                    && chord.keys.iter().all(|key| self.pressed.contains(key));
+                if trigger {
+                    self.latched = true;
+                }
+                return HotkeyHookResult {
+                    trigger,
+                    ..HotkeyHookResult::default()
+                };
+            }
+            self.pressed.remove(&virtual_key);
+            if self.pressed.is_empty() {
+                self.reset_gesture();
+            }
+            return HotkeyHookResult::default();
+        }
         if !chord.keys.contains(&virtual_key) {
             if !self.buffered.is_empty() {
                 return self.cancel_buffered(Some(event));
@@ -2496,7 +2526,15 @@ unsafe fn replay_keyboard_events(events: &[ReplayKeyboardEvent]) {
             }
         })
         .collect::<Vec<_>>();
-    let _ = SendInput(&inputs, size_of::<INPUT>() as i32);
+    let inserted = SendInput(&inputs, size_of::<INPUT>() as i32);
+    if inserted as usize != inputs.len() {
+        log::warn!(
+            target: "hotkey",
+            "SendInput replay was incomplete inserted={inserted} expected={}: {}",
+            inputs.len(),
+            display_windows_error(Error::from_thread())
+        );
+    }
 }
 
 unsafe extern "system" fn ghost_keyboard_hook(
@@ -2680,10 +2718,6 @@ unsafe fn configure_ghost_hotkey(
     let changed = controller.hotkey_chord != desired;
     if changed {
         controller.hotkey_chord = desired.clone();
-        controller.hotkey_hidden = false;
-    }
-    if desired.is_none() {
-        controller.hotkey_hidden = false;
     }
     if changed {
         GHOST_KEYBOARD_HOOK_STATE.with(|state| {
@@ -2692,16 +2726,16 @@ unsafe fn configure_ghost_hotkey(
             state.tracker.set_chord(desired);
         });
     }
-    Ok(controller.desktop_visible && !controller.hotkey_hidden)
+    Ok(controller.desktop_visible)
 }
 
 unsafe fn toggle_hotkey_fences(controller_window: HWND) {
     let (windows, show) = match state_mut(controller_window) {
         Some(WindowState::Controller(controller)) if controller.hotkey_chord.is_some() => {
-            controller.hotkey_hidden = !controller.hotkey_hidden;
+            controller.desktop_visible = !controller.desktop_visible;
             (
                 controller.windows.values().copied().collect::<Vec<_>>(),
-                controller.desktop_visible && !controller.hotkey_hidden,
+                controller.desktop_visible,
             )
         }
         _ => return,
@@ -2717,6 +2751,7 @@ unsafe fn toggle_hotkey_fences(controller_window: HWND) {
         }
         let _ = ShowWindow(window, if show { SW_SHOWNOACTIVATE } else { SW_HIDE });
     }
+    emit_event(&HostEvent::DesktopVisibilityChanged { visible: show });
 }
 
 unsafe fn create_fence_window(
@@ -2779,8 +2814,14 @@ unsafe fn create_fence_window(
         let _ = DestroyWindow(window);
         return Err(error);
     }
-    apply_fence_window(window, visible)?;
-    place_fence_layers(window)?;
+    if let Err(error) = apply_fence_window(window, visible) {
+        let _ = DestroyWindow(window);
+        return Err(format!("阶段=初始化盒子窗口：{error}"));
+    }
+    if let Err(error) = place_fence_layers(window) {
+        let _ = DestroyWindow(window);
+        return Err(error);
+    }
     if SetTimer(Some(window), FENCE_TIMER, FENCE_TIMER_INTERVAL_MS, None) == 0 {
         let _ = DestroyWindow(window);
         return Err(display_windows_error(Error::from_thread()));
@@ -5966,6 +6007,8 @@ unsafe fn show_box_menu(
         FENCE_MENU_REMOVE,
         "移除盒子（保留文件夹）",
     )?;
+    append_menu_separator(menu.0)?;
+    append_menu_item(menu.0, MF_STRING, FENCE_MENU_QUIT, "退出 DCreel")?;
 
     let action = match track_popup_menu(window, menu.0, screen_point) {
         FENCE_MENU_NEW => Some(HostUserAction::CreateStorageBox),
@@ -6023,6 +6066,9 @@ unsafe fn show_box_menu(
                 id: snapshot.id.clone(),
             })
         }
+        FENCE_MENU_QUIT if confirm_quit_application(window) => {
+            Some(HostUserAction::QuitApplication)
+        }
         _ => None,
     };
     if let Some(action) = action {
@@ -6077,6 +6123,21 @@ unsafe fn confirm_remove_fence(window: HWND, title: &str) -> bool {
         format!("要从 DCreel 中移除「{title}」吗？\n\n磁盘上的文件夹和其中内容不会删除。");
     let message: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
     let caption: Vec<u16> = "移除盒子".encode_utf16().chain(Some(0)).collect();
+    MessageBoxW(
+        Some(window),
+        PCWSTR(message.as_ptr()),
+        PCWSTR(caption.as_ptr()),
+        MB_OKCANCEL | MB_ICONQUESTION,
+    ) == IDOK
+}
+
+unsafe fn confirm_quit_application(window: HWND) -> bool {
+    let message: Vec<u16> =
+        "确定要彻底退出 DCreel 吗？\n\n所有桌面盒子会一起关闭，文件夹和文件不会删除。"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+    let caption: Vec<u16> = "退出 DCreel".encode_utf16().chain(Some(0)).collect();
     MessageBoxW(
         Some(window),
         PCWSTR(message.as_ptr()),
@@ -6775,7 +6836,7 @@ unsafe extern "system" fn enum_desktop_hosts(window: HWND, parameter: LPARAM) ->
     if length > 0 {
         match String::from_utf16_lossy(&class_name[..length as usize]).as_str() {
             "Progman" => hosts.progman = Some(window),
-            "WorkerW" if hosts.worker.is_none() => hosts.worker = Some(window),
+            "WorkerW" => hosts.workers.push(window),
             _ => {}
         }
     }
@@ -6789,21 +6850,58 @@ unsafe fn place_on_desktop(window: HWND) -> Result<(), String> {
         LPARAM((&mut hosts as *mut DesktopHosts) as isize),
     )
     .map_err(display_windows_error)?;
-    let host = hosts
-        .progman
-        .or(hosts.worker)
-        .ok_or_else(|| "没有找到 Windows 桌面宿主窗口".to_string())?;
-    let above = GetWindow(host, GW_HWNDPREV).unwrap_or(HWND_TOP);
-    SetWindowPos(
-        window,
-        Some(above),
-        0,
-        0,
-        0,
-        0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-    )
-    .map_err(display_windows_error)
+    let mut candidates = Vec::with_capacity(hosts.workers.len() + 1);
+    if let Some(progman) = hosts.progman {
+        candidates.push(("Progman", progman));
+    }
+    candidates.extend(hosts.workers.into_iter().map(|worker| ("WorkerW", worker)));
+    if candidates.is_empty() {
+        return Err("阶段=查找桌面宿主：没有找到 Progman 或 WorkerW".into());
+    }
+
+    let mut failures = Vec::new();
+    for (class_name, host) in candidates {
+        let above = match GetWindow(host, GW_HWNDPREV) {
+            Ok(above) => above,
+            Err(error) => {
+                failures.push(format!(
+                    "{class_name} host={:p} 无法取得前一窗口：{}",
+                    host.0,
+                    display_windows_error(error)
+                ));
+                continue;
+            }
+        };
+        match SetWindowPos(
+            window,
+            Some(above),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+        ) {
+            Ok(()) => {
+                log::debug!(
+                    target: "desktop_layer",
+                    "placed fence window={:p} using {class_name} host={:p} insert_after={:p}",
+                    window.0, host.0, above.0
+                );
+                return Ok(());
+            }
+            Err(error) => failures.push(format!(
+                "{class_name} host={:p} insert_after={:p}: {}",
+                host.0,
+                above.0,
+                display_windows_error(error)
+            )),
+        }
+    }
+    Err(format!(
+        "阶段=设置桌面窗口层级 window={:p}：{}",
+        window.0,
+        failures.join("；")
+    ))
 }
 
 unsafe fn activate_fence_temporarily(window: HWND) {
@@ -7322,82 +7420,69 @@ mod tests {
 
         assert_eq!(
             tracker.handle_key(u32::from(b'Z'), true),
-            HotkeyHookResult {
-                trigger: false,
-                suppress: true,
-                ..HotkeyHookResult::default()
-            }
+            HotkeyHookResult::default()
         );
         assert_eq!(
             tracker.handle_key(u32::from(b'X'), true),
             HotkeyHookResult {
                 trigger: true,
-                suppress: true,
                 ..HotkeyHookResult::default()
             }
         );
         assert!(!tracker.handle_key(u32::from(b'X'), true).trigger);
-        assert!(tracker.handle_key(u32::from(b'X'), false).suppress);
+        assert!(!tracker.handle_key(u32::from(b'X'), false).suppress);
         assert!(!tracker.handle_key(u32::from(b'X'), true).trigger);
-        assert!(tracker.handle_key(u32::from(b'X'), false).suppress);
-        assert!(tracker.handle_key(u32::from(b'Z'), false).suppress);
+        assert!(!tracker.handle_key(u32::from(b'X'), false).suppress);
+        assert!(!tracker.handle_key(u32::from(b'Z'), false).suppress);
 
         assert!(!tracker.handle_key(u32::from(b'X'), true).trigger);
         assert!(tracker.handle_key(u32::from(b'Z'), true).trigger);
     }
 
     #[test]
-    fn ordinary_hotkey_members_are_replayed_when_the_chord_is_not_completed() {
+    fn ordinary_hotkey_members_pass_through_when_the_chord_is_not_completed() {
         let mut tracker = HotkeyChordTracker::default();
         tracker.set_chord(Some(parse_hotkey("Z+X").unwrap()));
 
-        let down = tracker.handle_key(u32::from(b'Z'), true);
-        assert!(down.suppress);
-        assert!(down.replay.is_empty());
-
-        let up = tracker.handle_key(u32::from(b'Z'), false);
-        assert!(up.suppress);
         assert_eq!(
-            up.replay,
-            vec![
-                ReplayKeyboardEvent::key(u32::from(b'Z'), true),
-                ReplayKeyboardEvent::key(u32::from(b'Z'), false),
-            ]
+            tracker.handle_key(u32::from(b'Z'), true),
+            HotkeyHookResult::default()
         );
-
-        let x_down = tracker.handle_key(u32::from(b'X'), true);
-        assert!(x_down.suppress);
-        let x_up = tracker.handle_key(u32::from(b'X'), false);
         assert_eq!(
-            x_up.replay,
-            vec![
-                ReplayKeyboardEvent::key(u32::from(b'X'), true),
-                ReplayKeyboardEvent::key(u32::from(b'X'), false),
-            ]
+            tracker.handle_key(u32::from(b'Z'), false),
+            HotkeyHookResult::default()
+        );
+        assert_eq!(
+            tracker.handle_key(u32::from(b'X'), true),
+            HotkeyHookResult::default()
+        );
+        assert_eq!(
+            tracker.handle_key(u32::from(b'X'), false),
+            HotkeyHookResult::default()
         );
     }
 
     #[test]
-    fn overlapping_normal_typing_is_replayed_in_input_order() {
+    fn overlapping_normal_typing_is_never_intercepted() {
         let mut tracker = HotkeyChordTracker::default();
         tracker.set_chord(Some(parse_hotkey("Z+X").unwrap()));
 
-        assert!(tracker.handle_key(u32::from(b'Z'), true).suppress);
-        let unrelated = tracker.handle_key(u32::from(b'A'), true);
-        assert!(unrelated.suppress);
         assert_eq!(
-            unrelated.replay,
-            vec![
-                ReplayKeyboardEvent::key(u32::from(b'Z'), true),
-                ReplayKeyboardEvent::key(u32::from(b'Z'), false),
-                ReplayKeyboardEvent::key(u32::from(b'A'), true),
-            ]
+            tracker.handle_key(u32::from(b'Z'), true),
+            HotkeyHookResult::default()
+        );
+        assert_eq!(
+            tracker.handle_key(u32::from(b'A'), true),
+            HotkeyHookResult::default()
         );
         assert_eq!(
             tracker.handle_key(u32::from(b'A'), false),
             HotkeyHookResult::default()
         );
-        assert!(tracker.handle_key(u32::from(b'Z'), false).suppress);
+        assert_eq!(
+            tracker.handle_key(u32::from(b'Z'), false),
+            HotkeyHookResult::default()
+        );
     }
 
     #[test]

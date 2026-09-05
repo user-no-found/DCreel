@@ -2,9 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   Dashboard,
   Fence,
+  FencePatch,
   NewFenceInput,
-  Preferences,
-  SweepPreview
+  Preferences
 } from "../types";
 
 declare global {
@@ -68,29 +68,15 @@ export async function openLogDirectory(): Promise<void> {
   await invokeLogged("open_log_directory");
 }
 
+export async function quitApplication(): Promise<void> {
+  if (!isTauri()) return;
+  await invokeLogged("quit_app");
+}
+
 export async function takePendingNavigation(): Promise<string | null> {
   if (!isTauri()) return null;
   return invokeLogged<string | null>("take_pending_navigation");
 }
-
-const browserItems = [
-  {
-    name: "DCreel 产品草图.fig",
-    path: "/demo/DCreel 产品草图.fig",
-    isDir: false,
-    extension: "fig",
-    size: 3_840_000,
-    modifiedAt: Date.now()
-  },
-  {
-    name: "需求与灵感",
-    path: "/demo/需求与灵感",
-    isDir: true,
-    extension: null,
-    size: null,
-    modifiedAt: Date.now()
-  }
-];
 
 const browserDashboard: Dashboard = {
   fences: [
@@ -106,7 +92,7 @@ const browserDashboard: Dashboard = {
       contentColor: "paper",
       collapsed: false,
       locked: false,
-      items: browserItems
+      itemCount: 2
     },
     {
       id: "projects",
@@ -120,32 +106,7 @@ const browserDashboard: Dashboard = {
       contentColor: "frosted",
       collapsed: false,
       locked: false,
-      items: [
-        {
-          name: "桌面整理方案.pdf",
-          path: "/demo/桌面整理方案.pdf",
-          isDir: false,
-          extension: "pdf",
-          size: 1_420_000,
-          modifiedAt: Date.now()
-        },
-        {
-          name: "参考截图.png",
-          path: "/demo/参考截图.png",
-          isDir: false,
-          extension: "png",
-          size: 840_000,
-          modifiedAt: Date.now()
-        },
-        {
-          name: "开发文档.md",
-          path: "/demo/开发文档.md",
-          isDir: false,
-          extension: "md",
-          size: 24_000,
-          modifiedAt: Date.now()
-        }
-      ]
+      itemCount: 3
     },
     {
       id: "inspiration",
@@ -159,7 +120,7 @@ const browserDashboard: Dashboard = {
       contentColor: "paper",
       collapsed: false,
       locked: false,
-      items: []
+      itemCount: 0
     }
   ],
   preferences: {
@@ -181,7 +142,7 @@ const browserDashboard: Dashboard = {
     desktopMode: true,
     desktopContextMenu: true
   },
-  desktopPath: "C:\\Users\\DCreel\\Desktop"
+  desktopVisible: true
 };
 
 let mock = structuredClone(browserDashboard);
@@ -200,7 +161,7 @@ function mockFence(input: NewFenceInput, directory: string): Fence {
     contentColor: input.contentColor,
     collapsed: false,
     locked: false,
-    items: []
+    itemCount: 0
   };
 }
 
@@ -210,7 +171,10 @@ export async function loadDashboard(): Promise<Dashboard> {
 }
 
 export async function setDesktopVisibility(visible: boolean): Promise<boolean> {
-  if (!isTauri()) return visible;
+  if (!isTauri()) {
+    mock.desktopVisible = visible;
+    return visible;
+  }
   return invokeLogged<boolean>("set_desktop_visibility", { visible });
 }
 
@@ -226,22 +190,28 @@ export async function createStorageBox(input: NewFenceInput): Promise<Fence> {
 
 export async function createMappedBox(input: NewFenceInput): Promise<Fence> {
   if (!isTauri()) {
-    const fence = mockFence(input, input.directory ?? "C:\\Users\\DCreel\\Documents");
+    const directory = input.directory ?? "C:\\Users\\DCreel\\Documents";
+    const existing = mock.fences.find(
+      (fence) => fence.directory.toLocaleLowerCase() === directory.toLocaleLowerCase()
+    );
+    if (existing) throw new Error(`该文件夹已经映射为「${existing.title}」`);
+    const fence = mockFence(input, directory);
     mock.fences.push(fence);
     return structuredClone(fence);
   }
   return invokeLogged<Fence>("create_mapped_box", { input });
 }
 
-export async function saveFence(fence: Fence): Promise<void> {
+export async function saveFence(id: string, patch: FencePatch): Promise<Fence> {
   if (!isTauri()) {
     mock.fences = mock.fences.map((current) =>
-      current.id === fence.id ? structuredClone(fence) : current
+      current.id === id ? { ...current, ...structuredClone(patch) } : current
     );
-    return;
+    const updated = mock.fences.find((fence) => fence.id === id);
+    if (!updated) throw new Error(`没有找到盒子：${id}`);
+    return structuredClone(updated);
   }
-  const { items: _items, ...payload } = fence;
-  await invokeLogged("update_fence", { fence: payload });
+  return invokeLogged<Fence>("update_fence", { id, patch });
 }
 
 export async function deleteFence(id: string): Promise<void> {
@@ -252,12 +222,12 @@ export async function deleteFence(id: string): Promise<void> {
   await invokeLogged("remove_fence", { id });
 }
 
-export async function savePreferences(preferences: Preferences): Promise<Preferences> {
+export async function savePreferences(patch: Partial<Preferences>): Promise<Preferences> {
   if (!isTauri()) {
-    mock.preferences = structuredClone(preferences);
-    return preferences;
+    mock.preferences = { ...mock.preferences, ...structuredClone(patch) };
+    return structuredClone(mock.preferences);
   }
-  return invokeLogged<Preferences>("update_preferences", { preferences });
+  return invokeLogged<Preferences>("update_preferences", { patch });
 }
 
 export async function openItem(path: string): Promise<void> {
@@ -276,29 +246,4 @@ export async function openProjectRepository(): Promise<void> {
 export async function setHotkeyCaptureActive(active: boolean): Promise<void> {
   if (!isTauri()) return;
   await invokeLogged("set_hotkey_capture_active", { active });
-}
-
-export async function revealItem(path: string): Promise<void> {
-  if (!isTauri()) return;
-  await invokeLogged("reveal_path", { path });
-}
-
-export async function getSweepPreview(): Promise<SweepPreview> {
-  if (!isTauri()) {
-    return {
-      total: 23,
-      groups: [
-        { key: "images", label: "图片素材", count: 8, bytes: 18_400_000 },
-        { key: "documents", label: "文档资料", count: 7, bytes: 5_200_000 },
-        { key: "archives", label: "压缩包", count: 3, bytes: 42_000_000 },
-        { key: "shortcuts", label: "应用快捷方式", count: 5, bytes: 92_000 }
-      ]
-    };
-  }
-  return invokeLogged<SweepPreview>("preview_desktop_sweep");
-}
-
-export async function runSweep(): Promise<Dashboard> {
-  if (!isTauri()) return structuredClone(mock);
-  return invokeLogged<Dashboard>("organize_desktop");
 }

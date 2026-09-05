@@ -152,21 +152,10 @@ pub(crate) fn state_version() -> u32 {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct DesktopItem {
-    pub name: String,
-    pub path: PathBuf,
-    pub is_dir: bool,
-    pub extension: Option<String>,
-    pub size: Option<u64>,
-    pub modified_at: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct FenceView {
     #[serde(flatten)]
     pub config: FenceConfig,
-    pub items: Vec<DesktopItem>,
+    pub item_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -174,7 +163,71 @@ pub struct FenceView {
 pub struct Dashboard {
     pub fences: Vec<FenceView>,
     pub preferences: Preferences,
-    pub desktop_path: Option<PathBuf>,
+    pub desktop_visible: bool,
+}
+
+/// 只允许控制界面修改非几何属性。盒子坐标、尺寸和显示器锚点只能由
+/// Desktop Host 的几何事件更新，防止陈旧的控制台快照覆盖刚完成的拖动。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FencePatch {
+    pub title: Option<String>,
+    pub color: Option<String>,
+    pub content_color: Option<String>,
+    pub collapsed: Option<bool>,
+    pub locked: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreferencesPatch {
+    pub title_opacity: Option<f64>,
+    pub content_opacity: Option<f64>,
+    pub show_fence_border: Option<bool>,
+    pub fence_border_opacity: Option<f64>,
+    pub icon_size: Option<u32>,
+    pub default_fence_width: Option<f64>,
+    pub default_fence_height: Option<f64>,
+    pub ghost_mode: Option<bool>,
+    pub ghost_mode_trigger: Option<GhostModeTrigger>,
+    pub ghost_opacity: Option<f64>,
+    pub ghost_hotkey: Option<String>,
+    pub start_on_boot: Option<bool>,
+    pub show_hidden_files: Option<bool>,
+    pub show_fence_titles: Option<bool>,
+    pub show_tray_icon: Option<bool>,
+    pub desktop_mode: Option<bool>,
+    pub desktop_context_menu: Option<bool>,
+}
+
+impl PreferencesPatch {
+    pub fn apply_to(self, preferences: &mut Preferences) {
+        macro_rules! apply {
+            ($field:ident) => {
+                if let Some(value) = self.$field {
+                    preferences.$field = value;
+                }
+            };
+        }
+
+        apply!(title_opacity);
+        apply!(content_opacity);
+        apply!(show_fence_border);
+        apply!(fence_border_opacity);
+        apply!(icon_size);
+        apply!(default_fence_width);
+        apply!(default_fence_height);
+        apply!(ghost_mode);
+        apply!(ghost_mode_trigger);
+        apply!(ghost_opacity);
+        apply!(ghost_hotkey);
+        apply!(start_on_boot);
+        apply!(show_hidden_files);
+        apply!(show_fence_titles);
+        apply!(show_tray_icon);
+        apply!(desktop_mode);
+        apply!(desktop_context_menu);
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,22 +242,6 @@ pub struct NewFenceInput {
 
 fn default_content_color() -> String {
     "paper".into()
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SweepGroup {
-    pub key: String,
-    pub label: String,
-    pub count: usize,
-    pub bytes: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SweepPreview {
-    pub total: usize,
-    pub groups: Vec<SweepGroup>,
 }
 
 #[cfg(test)]
@@ -227,5 +264,21 @@ mod tests {
         assert_eq!(preferences.ghost_mode_trigger, GhostModeTrigger::Automatic);
         assert_eq!(preferences.ghost_opacity, 0.2);
         assert_eq!(preferences.ghost_hotkey, "Ctrl+Alt+G");
+    }
+
+    #[test]
+    fn preference_patch_changes_only_present_fields() {
+        let mut preferences = Preferences::default();
+        PreferencesPatch {
+            icon_size: Some(60),
+            show_tray_icon: Some(false),
+            ..PreferencesPatch::default()
+        }
+        .apply_to(&mut preferences);
+
+        assert_eq!(preferences.icon_size, 60);
+        assert!(!preferences.show_tray_icon);
+        assert_eq!(preferences.title_opacity, 0.9);
+        assert!(preferences.desktop_context_menu);
     }
 }

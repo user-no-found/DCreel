@@ -1,6 +1,6 @@
 [package]
 name = "creel-desktop-host"
-version = "0.1.0"
+version = "0.1.1"
 description = "Out-of-process native Windows desktop renderer for DCreel"
 edition = "2024"
 license = "Apache-2.0"

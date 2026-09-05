@@ -51,6 +51,19 @@ mod platform {
         events: mpsc::Receiver<Result<HostEvent, String>>,
     }
 
+    enum SyncFailure {
+        Host(String),
+        Transport(String),
+    }
+
+    impl std::fmt::Display for SyncFailure {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::Host(message) | Self::Transport(message) => formatter.write_str(message),
+            }
+        }
+    }
+
     enum NativeRequest {
         ImportFiles {
             fence_id: String,
@@ -176,9 +189,22 @@ mod platform {
                 state.fences.len()
             );
             if let Err(first_error) = send_sync(&mut controller, &executable, &self.app, &command) {
+                let first_error = match first_error {
+                    SyncFailure::Host(message) => {
+                        // Host 能正常回传结构化错误，说明 IPC 和进程仍然健康。
+                        // Explorer 启动阶段的桌面层拒绝访问通常是暂时的，无需
+                        // 反复销毁 Host；监督线程会用同一进程快速重试。
+                        log::warn!(
+                            target: "desktop_host",
+                            "sync revision={revision} was rejected by host and will retry: {message}"
+                        );
+                        return Err(message);
+                    }
+                    SyncFailure::Transport(message) => message,
+                };
                 log::warn!(
                     target: "desktop_host",
-                    "sync revision={revision} failed; restarting host: {first_error}"
+                    "sync revision={revision} transport failed; restarting host: {first_error}"
                 );
                 stop_running(controller.running.take());
                 controller.running = Some(spawn_host(&executable, &self.app)?);
@@ -187,10 +213,10 @@ mod platform {
                 {
                     log::error!(
                         target: "desktop_host",
-                        "sync revision={revision} failed after restart: {second_error}"
+                        "sync revision={revision} failed after transport restart: {second_error}"
                     );
                     stop_running(controller.running.take());
-                    return Err(second_error);
+                    return Err(second_error.to_string());
                 }
             }
             log::info!(
@@ -317,10 +343,10 @@ mod platform {
             Duration::from_millis(250),
             Duration::from_millis(500),
             Duration::from_secs(1),
+            Duration::from_secs(1),
             Duration::from_secs(2),
-            Duration::from_secs(4),
-            Duration::from_secs(8),
-            Duration::from_secs(15),
+            Duration::from_secs(3),
+            Duration::from_secs(5),
         ];
         const MONITOR_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -383,24 +409,26 @@ mod platform {
         executable: &Path,
         app: &AppHandle,
         command: &HostCommand,
-    ) -> Result<(), String> {
+    ) -> Result<(), SyncFailure> {
         let needs_start = match controller.running.as_mut() {
             Some(running) => running
                 .child
                 .try_wait()
-                .map_err(|error| format!("无法检查 Desktop Host 状态：{error}"))?
+                .map_err(|error| {
+                    SyncFailure::Transport(format!("无法检查 Desktop Host 状态：{error}"))
+                })?
                 .is_some(),
             None => true,
         };
         if needs_start {
             stop_running(controller.running.take());
-            controller.running = Some(spawn_host(executable, app)?);
+            controller.running = Some(spawn_host(executable, app).map_err(SyncFailure::Transport)?);
         }
         let running = controller
             .running
             .as_mut()
-            .ok_or_else(|| "Desktop Host 没有启动".to_string())?;
-        send_command(&mut running.stdin, command)?;
+            .ok_or_else(|| SyncFailure::Transport("Desktop Host 没有启动".to_string()))?;
+        send_command(&mut running.stdin, command).map_err(SyncFailure::Transport)?;
         let expected_revision = match command {
             HostCommand::Sync { revision, .. } => *revision,
             _ => return Ok(()),
@@ -409,18 +437,22 @@ mod platform {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return Err(format!(
+                return Err(SyncFailure::Transport(format!(
                     "Desktop Host 没有确认 revision {expected_revision}"
-                ));
+                )));
             }
             match running.events.recv_timeout(remaining) {
                 Ok(Ok(HostEvent::Synced { revision, .. })) if revision == expected_revision => {
                     return Ok(());
                 }
-                Ok(Ok(HostEvent::Error { message })) => return Err(message),
+                Ok(Ok(HostEvent::Error { message })) => return Err(SyncFailure::Host(message)),
                 Ok(Ok(_)) => continue,
-                Ok(Err(error)) => return Err(error),
-                Err(error) => return Err(format!("等待 Desktop Host 同步确认失败：{error}")),
+                Ok(Err(error)) => return Err(SyncFailure::Transport(error)),
+                Err(error) => {
+                    return Err(SyncFailure::Transport(format!(
+                        "等待 Desktop Host 同步确认失败：{error}"
+                    )));
+                }
             }
         }
     }
@@ -505,6 +537,16 @@ mod platform {
                 });
                 if let Ok(HostEvent::Notification { message }) = &event {
                     let _ = callback_app.emit("creel://notification", message.clone());
+                    continue;
+                }
+                if let Ok(HostEvent::DesktopVisibilityChanged { visible }) = &event {
+                    if let Some(store) = callback_app.try_state::<AppStore>() {
+                        store.set_desktop_visible(*visible);
+                        let _ = callback_app.emit("creel://state-changed", ());
+                    }
+                    if let Some(host) = callback_app.try_state::<DesktopHostController>() {
+                        host.request_sync();
+                    }
                     continue;
                 }
                 if let Ok(HostEvent::GeometryChanged {
@@ -610,6 +652,10 @@ mod platform {
         store: tauri::State<'_, AppStore>,
         action: HostUserAction,
     ) -> Result<Option<String>, String> {
+        if matches!(action, HostUserAction::QuitApplication) {
+            crate::quit_application(app);
+            return Ok(None);
+        }
         if matches!(action, HostUserAction::CreateStorageBox) {
             crate::request_storage_box_ui(app);
             return Ok(None);
@@ -626,11 +672,13 @@ mod platform {
             | HostUserAction::SetFenceColor { id, .. }
             | HostUserAction::ResetFenceSize { id }
             | HostUserAction::RemoveFence { id } => id,
-            HostUserAction::CreateStorageBox | HostUserAction::CreateMappedBox => {
+            HostUserAction::CreateStorageBox
+            | HostUserAction::CreateMappedBox
+            | HostUserAction::QuitApplication => {
                 unreachable!()
             }
         };
-        let mut fence = store
+        let fence = store
             .lock()
             .map_err(|error| error.to_string())?
             .fences
@@ -641,62 +689,68 @@ mod platform {
 
         match action {
             HostUserAction::RenameFence { title, .. } => {
-                fence.title = title;
-                crate::commands::update_fence(fence.clone(), app.clone(), store)?;
-                Ok(Some(format!("已重命名为「{}」", fence.title)))
+                let view = crate::commands::update_fence_inner(
+                    &fence.id,
+                    crate::models::FencePatch {
+                        title: Some(title),
+                        ..Default::default()
+                    },
+                    app,
+                    &store,
+                )?;
+                Ok(Some(format!("已重命名为「{}」", view.config.title)))
             }
             HostUserAction::ToggleFenceCollapsed { .. } => {
-                fence.collapsed = !fence.collapsed;
-                crate::commands::update_fence(fence.clone(), app.clone(), store)?;
-                Ok(Some(if fence.collapsed {
-                    format!("已收起「{}」", fence.title)
+                let collapsed = !fence.collapsed;
+                let view = crate::commands::update_fence_inner(
+                    &fence.id,
+                    crate::models::FencePatch {
+                        collapsed: Some(collapsed),
+                        ..Default::default()
+                    },
+                    app,
+                    &store,
+                )?;
+                Ok(Some(if collapsed {
+                    format!("已收起「{}」", view.config.title)
                 } else {
-                    format!("已展开「{}」", fence.title)
+                    format!("已展开「{}」", view.config.title)
                 }))
             }
             HostUserAction::ToggleFenceLocked { .. } => {
-                fence.locked = !fence.locked;
-                crate::commands::update_fence(fence.clone(), app.clone(), store)?;
-                Ok(Some(if fence.locked {
-                    format!("已锁定「{}」的位置", fence.title)
+                let locked = !fence.locked;
+                let view = crate::commands::update_fence_inner(
+                    &fence.id,
+                    crate::models::FencePatch {
+                        locked: Some(locked),
+                        ..Default::default()
+                    },
+                    app,
+                    &store,
+                )?;
+                Ok(Some(if locked {
+                    format!("已锁定「{}」的位置", view.config.title)
                 } else {
-                    format!("已解锁「{}」的位置", fence.title)
+                    format!("已解锁「{}」的位置", view.config.title)
                 }))
             }
             HostUserAction::SetFenceColor { color, .. } => {
-                fence.color = color;
-                crate::commands::update_fence(fence, app.clone(), store)?;
+                crate::commands::update_fence_inner(
+                    &fence.id,
+                    crate::models::FencePatch {
+                        color: Some(color),
+                        ..Default::default()
+                    },
+                    app,
+                    &store,
+                )?;
                 Ok(Some("已更新盒子颜色".into()))
             }
             HostUserAction::ResetFenceSize { .. } => {
-                let (width, height, other_fences) = {
-                    let state = store.lock().map_err(|error| error.to_string())?;
-                    (
-                        state.preferences.default_fence_width,
-                        state.preferences.default_fence_height,
-                        state
-                            .fences
-                            .iter()
-                            .filter(|other| other.id != fence.id)
-                            .cloned()
-                            .collect::<Vec<_>>(),
-                    )
-                };
-                let overlaps = other_fences.iter().any(|other| {
-                    fence.x < other.x + other.width
-                        && fence.x + width > other.x
-                        && fence.y < other.y + other.height
-                        && fence.y + height > other.y
-                });
-                if overlaps {
-                    (fence.x, fence.y) = crate::store::next_position(&other_fences, width, height);
-                }
-                fence.width = width;
-                fence.height = height;
-                crate::commands::update_fence(fence.clone(), app.clone(), store)?;
+                let view = crate::commands::reset_fence_size_inner(&fence.id, app, &store)?;
                 Ok(Some(format!(
                     "已把「{}」恢复为默认大小 {} × {}",
-                    fence.title, width as i32, height as i32
+                    view.config.title, view.config.width as i32, view.config.height as i32
                 )))
             }
             HostUserAction::RemoveFence { .. } => {
@@ -706,7 +760,9 @@ mod platform {
                     "已移除「{title}」；文件夹和其中的内容没有删除"
                 )))
             }
-            HostUserAction::CreateStorageBox | HostUserAction::CreateMappedBox => {
+            HostUserAction::CreateStorageBox
+            | HostUserAction::CreateMappedBox
+            | HostUserAction::QuitApplication => {
                 unreachable!()
             }
         }

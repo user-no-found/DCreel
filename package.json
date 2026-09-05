@@ -1,12 +1,13 @@
 {
   "name": "dcreel",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "test": "vitest run",
     "build:native": "cargo build --manifest-path src-tauri/Cargo.toml -p creel-shell --lib && cargo build --manifest-path src-tauri/Cargo.toml -p creel-desktop-host",
     "build:native:release": "cargo build --release --manifest-path src-tauri/Cargo.toml -p creel-shell --lib && cargo build --release --manifest-path src-tauri/Cargo.toml -p creel-desktop-host",
     "build:release": "tauri build --no-bundle",
@@ -32,7 +33,8 @@
     "@vitejs/plugin-react": "^6.1.1",
     "sharp": "^0.35.4",
     "typescript": "~7.0.2",
-    "vite": "^8.2.2"
+    "vite": "^8.2.2",
+    "vitest": "^5.0.0"
   },
   "allowScripts": {
     "sharp@0.35.4": true

@@ -1,15 +1,15 @@
 use crate::models::{
-    Dashboard, DesktopItem, FenceConfig, FencePlacement, FenceView, PersistedState, Preferences,
-    state_version,
+    Dashboard, FenceConfig, FencePlacement, FenceView, PersistedState, Preferences, state_version,
 };
 use std::{
     fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::{
         Mutex, MutexGuard,
         atomic::{AtomicBool, Ordering},
     },
-    time::UNIX_EPOCH,
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{AppHandle, Manager};
 use thiserror::Error;
@@ -43,20 +43,9 @@ impl AppStore {
             .map(PathBuf::from)
             .unwrap_or(app.path().app_config_dir()?);
         fs::create_dir_all(&root_dir)?;
+        cleanup_stale_state_temps(&root_dir);
         let config_path = root_dir.join("state.json");
-        let state = match load_current_state(&config_path)? {
-            Some(state) => state,
-            None => {
-                if config_path.exists() {
-                    fs::remove_file(&config_path)?;
-                }
-                // 新状态不再预设任何桌面文件夹或示例盒子。
-                // 用户在新建收纳盒时自行选择存放位置。
-                let fresh = PersistedState::default();
-                write_state(&config_path, &fresh)?;
-                fresh
-            }
-        };
+        let state = load_state_with_recovery(&config_path)?;
 
         Ok(Self {
             inner: Mutex::new(state),
@@ -75,7 +64,7 @@ impl AppStore {
 
     pub fn dashboard(&self) -> CreelResult<Dashboard> {
         let state = self.lock()?.clone();
-        Ok(dashboard_from_state(&state))
+        Ok(dashboard_from_state(&state, self.desktop_visible()))
     }
 
     pub fn fence_view(&self, fence: &FenceConfig) -> CreelResult<FenceView> {
@@ -92,7 +81,27 @@ impl AppStore {
     }
 }
 
-pub fn dashboard_from_state(state: &PersistedState) -> Dashboard {
+fn cleanup_stale_state_temps(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(".state.")
+            && name.ends_with(".tmp")
+            && let Err(error) = fs::remove_file(entry.path())
+        {
+            log::warn!(
+                target: "state",
+                "failed to remove stale state temporary file {}: {error}",
+                entry.path().display()
+            );
+        }
+    }
+}
+
+pub fn dashboard_from_state(state: &PersistedState, desktop_visible: bool) -> Dashboard {
     let fences = state
         .fences
         .iter()
@@ -102,21 +111,21 @@ pub fn dashboard_from_state(state: &PersistedState) -> Dashboard {
     Dashboard {
         fences,
         preferences: state.preferences.clone(),
-        desktop_path: dirs::desktop_dir(),
+        desktop_visible,
     }
 }
 
 fn fence_to_view(config: FenceConfig, show_hidden: bool) -> FenceView {
-    let items = list_directory(&config.directory, show_hidden).unwrap_or_default();
-    FenceView { config, items }
+    let item_count = count_directory_items(&config.directory, show_hidden).unwrap_or_default();
+    FenceView { config, item_count }
 }
 
-pub fn list_directory(directory: &Path, show_hidden: bool) -> CreelResult<Vec<DesktopItem>> {
+fn count_directory_items(directory: &Path, show_hidden: bool) -> CreelResult<usize> {
     if !directory.is_dir() {
-        return Ok(Vec::new());
+        return Ok(0);
     }
 
-    let mut items = Vec::new();
+    let mut count = 0usize;
     for entry in fs::read_dir(directory)? {
         let entry = match entry {
             Ok(entry) => entry,
@@ -129,43 +138,9 @@ pub fn list_directory(directory: &Path, show_hidden: bool) -> CreelResult<Vec<De
         if !show_hidden && is_hidden(&entry.path(), &name) {
             continue;
         }
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-        let is_dir = metadata.is_dir();
-        let modified_at = metadata
-            .modified()
-            .ok()
-            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-            .map(|value| value.as_millis().min(u64::MAX as u128) as u64);
-        items.push(DesktopItem {
-            name,
-            path: entry.path(),
-            is_dir,
-            extension: if is_dir {
-                None
-            } else {
-                entry
-                    .path()
-                    .extension()
-                    .map(|value| value.to_string_lossy().to_lowercase())
-            },
-            size: (!is_dir).then_some(metadata.len()),
-            modified_at,
-        });
-        if items.len() >= 500 {
-            break;
-        }
+        count = count.saturating_add(1);
     }
-
-    items.sort_by(|left, right| {
-        right
-            .is_dir
-            .cmp(&left.is_dir)
-            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
-    });
-    Ok(items)
+    Ok(count)
 }
 
 #[cfg(windows)]
@@ -357,21 +332,6 @@ pub fn safe_directory_name(title: &str) -> String {
     }
 }
 
-pub fn unique_directory(parent: &Path, title: &str) -> PathBuf {
-    let base = safe_directory_name(title);
-    let initial = parent.join(&base);
-    if !initial.exists() {
-        return initial;
-    }
-    for index in 2..10_000 {
-        let candidate = parent.join(format!("{base} ({index})"));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    parent.join(format!("{base}-{}", Uuid::new_v4()))
-}
-
 pub fn unique_destination(target_dir: &Path, file_name: &str) -> PathBuf {
     let initial = target_dir.join(file_name);
     if !initial.exists() {
@@ -412,10 +372,163 @@ fn load_current_state(path: &Path) -> CreelResult<Option<PersistedState>> {
     Ok(Some(serde_json::from_slice(&content)?))
 }
 
+fn load_state_with_recovery(path: &Path) -> CreelResult<PersistedState> {
+    match load_current_state(path) {
+        Ok(Some(state)) => return Ok(state),
+        Ok(None) if !path.exists() => {
+            if let Some(state) = load_backup_state(path) {
+                log::warn!(
+                    target: "state",
+                    "state.json is missing; restored the last valid backup"
+                );
+                write_state(path, &state)?;
+                return Ok(state);
+            }
+        }
+        Ok(None) => {
+            let archived = quarantine_state(path, "unsupported")?;
+            log::warn!(
+                target: "state",
+                "unsupported state version preserved at {}",
+                archived.display()
+            );
+            if let Some(state) = load_backup_state(path) {
+                log::warn!(target: "state", "restored the last compatible state backup");
+                write_state(path, &state)?;
+                return Ok(state);
+            }
+        }
+        Err(error) => {
+            let archived = quarantine_state(path, "invalid")?;
+            log::error!(
+                target: "state",
+                "invalid state preserved at {}: {error}",
+                archived.display()
+            );
+            if let Some(state) = load_backup_state(path) {
+                log::warn!(target: "state", "restored state.json from the last valid backup");
+                write_state(path, &state)?;
+                return Ok(state);
+            }
+        }
+    }
+
+    // 新状态不预设任何桌面文件夹或示例盒子。无法兼容或恢复的旧文件
+    // 已被保留为旁路副本，不再静默删除用户数据。
+    let fresh = PersistedState::default();
+    write_state(path, &fresh)?;
+    Ok(fresh)
+}
+
+fn load_backup_state(path: &Path) -> Option<PersistedState> {
+    let backup = state_backup_path(path);
+    match load_current_state(&backup) {
+        Ok(Some(state)) => Some(state),
+        Ok(None) => None,
+        Err(error) => {
+            log::error!(
+                target: "state",
+                "state backup is invalid and was left untouched at {}: {error}",
+                backup.display()
+            );
+            None
+        }
+    }
+}
+
+fn quarantine_state(path: &Path, reason: &str) -> CreelResult<PathBuf> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let archived = parent.join(format!(
+        "state.{reason}.{timestamp}.{}.json",
+        &Uuid::new_v4().to_string()[..8]
+    ));
+    fs::rename(path, &archived)?;
+    Ok(archived)
+}
+
+fn state_backup_path(path: &Path) -> PathBuf {
+    path.with_file_name("state.backup.json")
+}
+
 fn write_state(path: &Path, state: &PersistedState) -> CreelResult<()> {
     let bytes = serde_json::to_vec_pretty(state)?;
-    fs::write(path, bytes)?;
-    Ok(())
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".state.{}.tmp", Uuid::new_v4()));
+    let result = (|| -> io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        replace_state_file(&temporary, path, &state_backup_path(path))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result.map_err(CreelError::Io)
+}
+
+#[cfg(windows)]
+fn replace_state_file(temporary: &Path, target: &Path, backup: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{
+        Win32::Storage::FileSystem::{
+            MOVEFILE_WRITE_THROUGH, MoveFileExW, REPLACEFILE_WRITE_THROUGH, ReplaceFileW,
+        },
+        core::PCWSTR,
+    };
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    let temporary = wide(temporary);
+    let target_wide = wide(target);
+    if target.exists() {
+        match fs::remove_file(backup) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        let backup = wide(backup);
+        unsafe {
+            ReplaceFileW(
+                PCWSTR(target_wide.as_ptr()),
+                PCWSTR(temporary.as_ptr()),
+                PCWSTR(backup.as_ptr()),
+                REPLACEFILE_WRITE_THROUGH,
+                None,
+                None,
+            )
+            .map_err(|_| io::Error::last_os_error())
+        }
+    } else {
+        unsafe {
+            MoveFileExW(
+                PCWSTR(temporary.as_ptr()),
+                PCWSTR(target_wide.as_ptr()),
+                MOVEFILE_WRITE_THROUGH,
+            )
+            .map_err(|_| io::Error::last_os_error())
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_state_file(temporary: &Path, target: &Path, backup: &Path) -> io::Result<()> {
+    if target.exists() {
+        let backup_temporary = backup.with_extension(format!("tmp-{}", Uuid::new_v4()));
+        fs::copy(target, &backup_temporary)?;
+        fs::rename(&backup_temporary, backup)?;
+    }
+    fs::rename(temporary, target)
 }
 
 #[cfg(test)]
@@ -516,5 +629,80 @@ mod tests {
             f64::NEG_INFINITY,
             900.0
         ));
+    }
+
+    #[test]
+    fn state_writes_keep_the_previous_complete_document_as_backup() {
+        let directory = std::env::temp_dir().join(format!("dcreel-state-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("state.json");
+        let mut first = PersistedState::default();
+        first.preferences.title_opacity = 0.35;
+        write_state(&path, &first).unwrap();
+
+        let mut second = first.clone();
+        second.preferences.title_opacity = 0.8;
+        write_state(&path, &second).unwrap();
+
+        assert_eq!(
+            load_current_state(&path)
+                .unwrap()
+                .unwrap()
+                .preferences
+                .title_opacity,
+            0.8
+        );
+        assert_eq!(
+            load_current_state(&state_backup_path(&path))
+                .unwrap()
+                .unwrap()
+                .preferences
+                .title_opacity,
+            0.35
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn corrupt_state_is_quarantined_and_restored_from_backup() {
+        let directory = std::env::temp_dir().join(format!("dcreel-recovery-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("state.json");
+        let mut backed_up = PersistedState::default();
+        backed_up.preferences.content_opacity = 0.42;
+        write_state(&path, &backed_up).unwrap();
+        let mut latest = backed_up.clone();
+        latest.preferences.content_opacity = 0.9;
+        write_state(&path, &latest).unwrap();
+        fs::write(&path, b"{ definitely not valid json").unwrap();
+
+        let recovered = load_state_with_recovery(&path).unwrap();
+        assert_eq!(recovered.preferences.content_opacity, 0.42);
+        assert!(directory.read_dir().unwrap().flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("state.invalid.")
+        }));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn dashboard_item_count_is_exact_beyond_the_old_five_hundred_limit() {
+        let directory = std::env::temp_dir().join(format!("dcreel-count-{}", Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        for index in 0..503 {
+            fs::write(directory.join(format!("item-{index:04}.txt")), b"").unwrap();
+        }
+
+        assert_eq!(count_directory_items(&directory, true).unwrap(), 503);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn dashboard_uses_the_authoritative_runtime_visibility() {
+        let state = PersistedState::default();
+        assert!(!dashboard_from_state(&state, false).desktop_visible);
+        assert!(dashboard_from_state(&state, true).desktop_visible);
     }
 }

@@ -23,15 +23,6 @@ export interface FencePlacement {
   offsetYDip: number;
 }
 
-export interface DesktopItem {
-  name: string;
-  path: string;
-  isDir: boolean;
-  extension: string | null;
-  size: number | null;
-  modifiedAt: number | null;
-}
-
 export interface Fence {
   id: string;
   title: string;
@@ -46,8 +37,12 @@ export interface Fence {
   locked: boolean;
   displayAnchor?: DisplayAnchor | null;
   placement?: FencePlacement | null;
-  items: DesktopItem[];
+  itemCount: number;
 }
+
+export type FencePatch = Partial<
+  Pick<Fence, "title" | "color" | "contentColor" | "collapsed" | "locked">
+>;
 
 export interface Preferences {
   titleOpacity: number;
@@ -72,19 +67,7 @@ export interface Preferences {
 export interface Dashboard {
   fences: Fence[];
   preferences: Preferences;
-  desktopPath: string | null;
-}
-
-export interface SweepGroup {
-  key: string;
-  label: string;
-  count: number;
-  bytes: number;
-}
-
-export interface SweepPreview {
-  total: number;
-  groups: SweepGroup[];
+  desktopVisible: boolean;
 }
 
 export interface NewFenceInput {
