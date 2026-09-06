@@ -40,6 +40,8 @@ pub struct Preferences {
     pub desktop_mode: bool,
     #[serde(default = "default_true")]
     pub desktop_context_menu: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_update_version: Option<String>,
 }
 
 impl Default for Preferences {
@@ -62,6 +64,7 @@ impl Default for Preferences {
             show_tray_icon: true,
             desktop_mode: true,
             desktop_context_menu: true,
+            ignored_update_version: None,
         }
     }
 }
@@ -198,6 +201,7 @@ pub struct PreferencesPatch {
     pub show_tray_icon: Option<bool>,
     pub desktop_mode: Option<bool>,
     pub desktop_context_menu: Option<bool>,
+    pub ignored_update_version: Option<Option<String>>,
 }
 
 impl PreferencesPatch {
@@ -227,6 +231,7 @@ impl PreferencesPatch {
         apply!(show_tray_icon);
         apply!(desktop_mode);
         apply!(desktop_context_menu);
+        apply!(ignored_update_version);
     }
 }
 

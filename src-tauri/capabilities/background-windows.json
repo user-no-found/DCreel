@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "background-windows",
+  "description": "DCreel 更新通知与文件移动进度窗口所需的最小权限",
+  "windows": ["desktop-notification", "transfer-progress"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-hide",
+    "core:event:allow-listen"
+  ]
+}

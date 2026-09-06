@@ -39,8 +39,9 @@ use windows::{
         },
         System::{
             Com::{
-                CoTaskMemFree, DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject,
-                IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0,
+                CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, DATADIR_GET,
+                DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl,
+                IEnumFORMATETC, IEnumSTATDATA, IPersistFile, STGM_READ, STGMEDIUM, STGMEDIUM_0,
                 TYMED_HGLOBAL,
             },
             LibraryLoader::GetModuleHandleW,
@@ -67,9 +68,9 @@ use windows::{
                 CMF_CANRENAME, CMF_NORMAL, CMIC_MASK_PTINVOKE, CMINVOKECOMMANDINFO,
                 CMINVOKECOMMANDINFOEX, Common::ITEMIDLIST, DROPFILES, DragQueryFileW, HDROP,
                 IContextMenu, IContextMenu2, IContextMenu3, IShellFolder, IShellItemImageFactory,
-                SHBindToParent, SHCreateItemFromParsingName, SHCreateStdEnumFmtEtc,
+                IShellLinkW, SHBindToParent, SHCreateItemFromParsingName, SHCreateStdEnumFmtEtc,
                 SHParseDisplayName, SIIGBF, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
-                SIIGBF_THUMBNAILONLY, ShellExecuteW,
+                SIIGBF_THUMBNAILONLY, ShellExecuteW, ShellLink,
             },
             WindowsAndMessaging::{
                 AppendMenuW, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CREATESTRUCTW, CS_DBLCLKS,
@@ -256,6 +257,7 @@ struct FenceState {
     last_folder_refresh: Instant,
     last_layer_refresh: Instant,
     drop_target: Option<IDropTarget>,
+    drop_active: bool,
     active_shell_menu: Option<ActiveShellMenu>,
     selected_paths: HashSet<PathBuf>,
     selection_anchor: Option<PathBuf>,
@@ -303,6 +305,7 @@ impl IDropTarget_Impl for FenceDropTarget_Impl {
     ) -> windows::core::Result<()> {
         let accepts_files = supports_file_drop(data_object);
         self.accepts_files.set(accepts_files);
+        unsafe { set_fence_drop_active(self.window, accepts_files) };
         unsafe { set_move_effect(effect, accepts_files) };
         Ok(())
     }
@@ -319,6 +322,7 @@ impl IDropTarget_Impl for FenceDropTarget_Impl {
 
     fn DragLeave(&self) -> windows::core::Result<()> {
         self.accepts_files.set(false);
+        unsafe { set_fence_drop_active(self.window, false) };
         Ok(())
     }
 
@@ -330,6 +334,7 @@ impl IDropTarget_Impl for FenceDropTarget_Impl {
         effect: *mut DROPEFFECT,
     ) -> windows::core::Result<()> {
         self.accepts_files.set(false);
+        unsafe { set_fence_drop_active(self.window, false) };
         match dropped_paths(data_object) {
             Ok(paths) if !paths.is_empty() => {
                 let fence_id = unsafe {
@@ -354,6 +359,22 @@ impl IDropTarget_Impl for FenceDropTarget_Impl {
             }
         }
         Ok(())
+    }
+}
+
+unsafe fn set_fence_drop_active(window: HWND, active: bool) {
+    let changed = match state_mut(window) {
+        Some(WindowState::Fence(state)) if state.drop_active != active => {
+            state.drop_active = active;
+            if active {
+                state.foreground_until = Some(Instant::now() + FOREGROUND_IDLE_TIMEOUT);
+            }
+            true
+        }
+        _ => false,
+    };
+    if changed {
+        redraw_fence(window);
     }
 }
 
@@ -2784,6 +2805,7 @@ unsafe fn create_fence_window(
         last_folder_refresh: Instant::now(),
         last_layer_refresh: Instant::now(),
         drop_target: None,
+        drop_active: false,
         active_shell_menu: None,
         selected_paths: HashSet::new(),
         selection_anchor: None,
@@ -2898,6 +2920,7 @@ unsafe fn apply_fence_window(window: HWND, visible: bool) -> Result<(), String> 
         Some(WindowState::Fence(state)) => {
             if !visible {
                 state.mouse_inside = false;
+                state.drop_active = false;
             }
             (state.snapshot.clone(), state.preferences.show_fence_titles)
         }
@@ -4775,7 +4798,7 @@ unsafe fn render_fence_layered(window: HWND) -> Result<(), String> {
             let surface_alpha = ghost_surface_alpha(
                 state.preferences.ghost_mode
                     && state.preferences.ghost_mode_trigger == GhostModeTrigger::Automatic,
-                state.mouse_inside,
+                state.mouse_inside || state.drop_active,
                 state.preferences.ghost_opacity,
             );
             let chrome_height = title_bar_height(state.preferences.show_fence_titles);
@@ -5006,6 +5029,25 @@ unsafe fn draw_fence_surface(
                 &mut empty,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
+        }
+        if state.drop_active {
+            let target = RECT {
+                left: client.left.saturating_add(4),
+                top: content_top.saturating_add(4),
+                right: client.right.saturating_sub(4),
+                bottom: client.bottom.saturating_sub(4),
+            };
+            overlays.rectangles.push(DesktopRectangleOverlay {
+                bounds: target,
+                fill_color: rgb(91, 144, 184),
+                fill_alpha: 58,
+                border_color: rgb(67, 120, 161),
+                border_alpha: 225,
+            });
+            overlays.texts.push(DesktopTextOverlay {
+                value: format!("松开以移动到「{}」", state.snapshot.title),
+                rect: target,
+            });
         }
     }
     let _ = SelectObject(dc, previous_font);
@@ -6166,10 +6208,14 @@ unsafe fn prompt_rename(
 ) -> Result<Option<String>, String> {
     let mut parent_rect = RECT::default();
     GetWindowRect(window, &mut parent_rect).map_err(display_windows_error)?;
-    let width = 380;
-    let height = 168;
-    let x = parent_rect.left + ((parent_rect.right - parent_rect.left - width) / 2).max(0);
-    let y = parent_rect.top + ((parent_rect.bottom - parent_rect.top - height) / 2).max(0);
+    let work = display_anchor_for_rect(&parent_rect)
+        .map(|anchor| display_work_rect(&anchor))
+        .ok_or_else(|| "无法读取输入框所在屏幕的可用区域".to_string())?;
+    let rect = input_dialog_rect(&parent_rect, &work);
+    let width = rect.right - rect.left;
+    let height = rect.bottom - rect.top;
+    let x = rect.left;
+    let y = rect.top;
     let module = GetModuleHandleW(None).map_err(display_windows_error)?;
     let instance = HINSTANCE(module.0);
     let class_name: Vec<u16> = CLASS_NAME.encode_utf16().chain(Some(0)).collect();
@@ -6311,6 +6357,21 @@ unsafe fn prompt_rename(
     }
 }
 
+fn input_dialog_rect(parent: &RECT, work: &RECT) -> RECT {
+    let width = 380.min((work.right - work.left).max(1));
+    let height = 168.min((work.bottom - work.top).max(1));
+    let left = (parent.left + (parent.right - parent.left - width) / 2)
+        .clamp(work.left, work.right - width);
+    let top = (parent.top + (parent.bottom - parent.top - height) / 2)
+        .clamp(work.top, work.bottom - height);
+    RECT {
+        left,
+        top,
+        right: left + width,
+        bottom: top + height,
+    }
+}
+
 // CreateWindowExW exposes every geometry and identity field separately. This
 // small wrapper deliberately mirrors that API instead of hiding values in a tuple.
 #[allow(clippy::too_many_arguments)]
@@ -6433,6 +6494,12 @@ unsafe fn open_shell_path(window: HWND, path: &Path) -> Result<(), String> {
     if !path.exists() {
         return Err("文件或文件夹已经不存在".into());
     }
+    if let Some(target) = unavailable_shortcut_target(path)? {
+        return Err(format!(
+            "快捷方式指向的文件已不存在或暂时无法访问：{}",
+            target.display()
+        ));
+    }
     let operation: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
     let target: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let result = ShellExecuteW(
@@ -6449,6 +6516,39 @@ unsafe fn open_shell_path(window: HWND, path: &Path) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+unsafe fn unavailable_shortcut_target(path: &Path) -> Result<Option<PathBuf>, String> {
+    let is_shortcut = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"));
+    if !is_shortcut {
+        return Ok(None);
+    }
+    let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
+        .map_err(|error| format!("无法读取快捷方式：{error}"))?;
+    let persisted: IPersistFile = link
+        .cast()
+        .map_err(|error| format!("无法读取快捷方式：{error}"))?;
+    let shortcut: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    persisted
+        .Load(PCWSTR(shortcut.as_ptr()), STGM_READ)
+        .map_err(|error| format!("快捷方式文件已损坏或无法读取：{error}"))?;
+    let mut target = vec![0_u16; MAX_DROP_PATH_CHARS as usize + 1];
+    link.GetPath(&mut target, std::ptr::null_mut(), 0)
+        .map_err(|error| format!("无法读取快捷方式目标：{error}"))?;
+    let length = target
+        .iter()
+        .position(|value| *value == 0)
+        .unwrap_or(target.len());
+    if length == 0 {
+        // Windows 也支持只保存 PIDL 等 Shell 标识的快捷方式。这类快捷方式
+        // 没有普通文件路径，继续交给 ShellExecuteW 处理，不能误判为失效。
+        return Ok(None);
+    }
+    let target = PathBuf::from(OsString::from_wide(&target[..length]));
+    Ok((!target.exists()).then_some(target))
 }
 
 fn thumbnail_candidate(path: &Path) -> bool {
@@ -6792,7 +6892,9 @@ fn list_folder(folder: &Path, show_hidden_files: bool) -> Vec<FolderItem> {
             continue;
         };
         let metadata = entry.metadata().ok();
-        let name = entry.file_name().to_string_lossy().to_string();
+        let file_name = entry.file_name();
+        let raw_name = file_name.to_string_lossy();
+        let name = shortcut_display_name(&raw_name);
         if name.eq_ignore_ascii_case("desktop.ini") {
             continue;
         }
@@ -6827,6 +6929,23 @@ fn list_folder(folder: &Path, show_hidden_files: bool) -> Vec<FolderItem> {
             .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
     });
     items
+}
+
+fn shortcut_display_name(file_name: &str) -> String {
+    let path = Path::new(file_name);
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"))
+    {
+        return path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .filter(|stem| !stem.is_empty())
+            .unwrap_or(file_name)
+            .to_string();
+    }
+    file_name.to_string()
 }
 
 unsafe extern "system" fn enum_desktop_hosts(window: HWND, parameter: LPARAM) -> BOOL {
@@ -7075,6 +7194,38 @@ fn display_windows_error(error: Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn input_dialog_stays_on_screen_when_its_owner_is_small_and_near_an_edge() {
+        use super::*;
+        for work in [
+            RECT {
+                left: 0,
+                top: 0,
+                right: 2560,
+                bottom: 1540,
+            },
+            RECT {
+                left: -1920,
+                top: -200,
+                right: 0,
+                bottom: 840,
+            },
+        ] {
+            for (left, top) in [(work.left, work.top), (work.right - 200, work.bottom - 100)] {
+                let parent = RECT {
+                    left,
+                    top,
+                    right: left + 200,
+                    bottom: top + 100,
+                };
+                let rect = input_dialog_rect(&parent, &work);
+                assert!(rect.left >= work.left && rect.top >= work.top);
+                assert!(rect.right <= work.right && rect.bottom <= work.bottom);
+                assert_eq!(rect.right - rect.left, 380);
+                assert_eq!(rect.bottom - rect.top, 168);
+            }
+        }
+    }
     use super::*;
 
     fn test_display(
@@ -8214,6 +8365,14 @@ mod tests {
         assert_eq!(list_folder(&directory, true).len(), 2);
 
         fs::remove_dir_all(&directory).expect("temporary test directory should be removed");
+    }
+
+    #[test]
+    fn shortcut_display_name_hides_only_the_lnk_suffix() {
+        assert_eq!(shortcut_display_name("DCreel.lnk"), "DCreel");
+        assert_eq!(shortcut_display_name("DCreel.LNK"), "DCreel");
+        assert_eq!(shortcut_display_name("archive.tar.lnk"), "archive.tar");
+        assert_eq!(shortcut_display_name("notes.txt"), "notes.txt");
     }
 
     #[test]

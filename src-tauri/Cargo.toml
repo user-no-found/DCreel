@@ -1,6 +1,6 @@
 [package]
 name = "dcreel"
-version = "0.1.1"
+version = "0.1.2"
 description = "DCreel - a calm, local-first desktop organizer"
 authors = ["DCreel contributors"]
 edition = "2024"
@@ -44,6 +44,7 @@ uuid = { version = "1", features = ["v4"] }
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = [
   "Win32_Foundation",
+  "Win32_Graphics_Gdi",
   "Win32_Storage_FileSystem",
   "Win32_System_Com",
   "Win32_System_Ole",

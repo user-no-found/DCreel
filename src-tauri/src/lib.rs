@@ -1,9 +1,11 @@
 mod commands;
 mod desktop_context_menu;
 mod desktop_host;
+mod desktop_notifications;
 mod desktop_windows;
 mod diagnostics;
 mod directory_watchers;
+mod file_transfers;
 mod models;
 mod store;
 
@@ -61,6 +63,19 @@ fn shutdown_desktop_integration(app: &tauri::AppHandle) {
 }
 
 pub(crate) fn quit_application(app: &tauri::AppHandle) {
+    if app
+        .try_state::<file_transfers::FileTransferManager>()
+        .is_some_and(|transfers| transfers.is_active())
+    {
+        desktop_notifications::show_transfer_progress(app);
+        desktop_notifications::show_message(
+            app,
+            "文件仍在移动",
+            "请等待文件移动完成，或在进度窗口中安全取消后再退出 DCreel。",
+        );
+        log::warn!(target: "shutdown", "explicit quit deferred while a file transfer is active");
+        return;
+    }
     log::info!(target: "shutdown", "explicit quit command received");
     shutdown_desktop_integration(app);
     app.exit(0);
@@ -69,6 +84,121 @@ pub(crate) fn quit_application(app: &tauri::AppHandle) {
 #[tauri::command]
 fn quit_app(app: tauri::AppHandle) {
     quit_application(&app);
+}
+
+#[tauri::command]
+fn show_update_notification(version: String, app: tauri::AppHandle) -> Result<(), String> {
+    let version: String = version.trim().chars().take(64).collect();
+    if version.is_empty() {
+        return Err("更新版本号为空".into());
+    }
+    let ignored = app
+        .state::<AppStore>()
+        .lock()
+        .map_err(|error| error.to_string())?
+        .preferences
+        .ignored_update_version
+        .as_deref()
+        == Some(version.as_str());
+    if !ignored {
+        desktop_notifications::show_update(&app, version);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn ignore_update_version(version: String, app: tauri::AppHandle) -> Result<(), String> {
+    let version: String = version.trim().chars().take(64).collect();
+    if version.is_empty() {
+        return Err("更新版本号为空".into());
+    }
+    let store = app.state::<AppStore>();
+    {
+        let mut state = store.lock().map_err(|error| error.to_string())?;
+        state.preferences.ignored_update_version = Some(version.clone());
+        store.save(&state).map_err(|error| error.to_string())?;
+    }
+    let _ = app.emit("creel://state-changed", ());
+    log::info!(target: "updater", "desktop notification ignored version={version}");
+    Ok(())
+}
+
+#[tauri::command]
+fn show_update_details(app: tauri::AppHandle, notification_id: String) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("desktop-notification")
+        && !desktop_notifications::dismiss_notification(
+            &window,
+            Some(&notification_id),
+            "update-details",
+        )?
+    {
+        return Ok(());
+    }
+    let _ = app.emit_to("main", "creel://navigate", "about");
+    request_main_window(&app);
+    Ok(())
+}
+
+#[tauri::command]
+fn dismiss_auxiliary_window(
+    window: tauri::WebviewWindow,
+    notification_id: Option<String>,
+) -> Result<(), String> {
+    match window.label() {
+        "transfer-progress" => window
+            .state::<file_transfers::FileTransferManager>()
+            .dismiss_progress_window(&window),
+        "desktop-notification" => {
+            let id = notification_id.ok_or("缺少通知编号")?;
+            desktop_notifications::dismiss_notification(&window, Some(&id), "dismiss-command")
+                .map(|_| ())
+        }
+        _ => desktop_notifications::hide_auxiliary_window(&window, "dismiss-command"),
+    }
+}
+
+fn handle_window_event(window: &tauri::Window, event: &WindowEvent) {
+    if let WindowEvent::CloseRequested { api, .. } = event {
+        match window.label() {
+            "main" | "new-box" => {
+                api.prevent_close();
+                if let Err(error) = window.hide() {
+                    log::error!(target: "window", "failed to hide window label={}: {error}", window.label());
+                }
+            }
+            "desktop-notification" | "transfer-progress" => {
+                api.prevent_close();
+                if let Some(webview) = window.get_webview_window(window.label()) {
+                    if window.label() == "desktop-notification" {
+                        let _ = desktop_notifications::dismiss_notification(
+                            &webview,
+                            None,
+                            "native-close",
+                        );
+                    } else {
+                        let _ = dismiss_auxiliary_window(webview, None);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if matches!(window.label(), "desktop-notification" | "transfer-progress")
+        && matches!(
+            event,
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. }
+        )
+    {
+        let app = window.app_handle().clone();
+        let label = window.label().to_string();
+        // Defer until the native resize/DPI callback has finished.
+        tauri::async_runtime::spawn(async move {
+            let ui_app = app.clone();
+            let _ = app.run_on_main_thread(move || {
+                desktop_notifications::relayout_windows(&ui_app, &label)
+            });
+        });
+    }
 }
 
 fn request_desktop_sync(app: &tauri::AppHandle) {
@@ -275,6 +405,14 @@ pub fn run() {
     let initial_args = startup_args.clone();
 
     let builder = tauri::Builder::default()
+        .manage(desktop_notifications::NotificationManager::default())
+        .on_page_load(|webview, payload| {
+            if matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
+                && let Some(window) = webview.get_webview_window(webview.label())
+            {
+                desktop_notifications::notification_page_loading(&window);
+            }
+        })
         .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             log::info!(target: "ipc", "secondary instance received");
             handle_external_args(app, &args);
@@ -296,6 +434,7 @@ pub fn run() {
             app.manage(store);
             app.manage(PendingNavigation::default());
             app.manage(StartupController::new(show_main_when_ready));
+            app.manage(file_transfers::FileTransferManager::new(app.handle())?);
             let desktop_host = desktop_host::DesktopHostController::new(app.handle());
             app.manage(desktop_host);
             app.manage(directory_watchers::DirectoryWatchers::default());
@@ -339,14 +478,7 @@ pub fn run() {
             log::info!(target: "startup", "Tauri setup completed");
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let WindowEvent::CloseRequested { api, .. } = event
-                && (window.label() == "main" || window.label() == "new-box")
-            {
-                api.prevent_close();
-                let _ = window.hide();
-            }
-        })
+        .on_window_event(handle_window_event)
         .invoke_handler(tauri::generate_handler![
             commands::load_dashboard,
             commands::create_storage_box,
@@ -364,6 +496,15 @@ pub fn run() {
             backend_ready,
             take_pending_navigation,
             quit_app,
+            show_update_notification,
+            ignore_update_version,
+            show_update_details,
+            dismiss_auxiliary_window,
+            desktop_notifications::current_desktop_notification,
+            desktop_notifications::subscribe_desktop_notifications,
+            desktop_notifications::present_desktop_notification,
+            file_transfers::cancel_file_transfer,
+            file_transfers::current_file_transfer,
         ]);
 
     let app = match builder.build(tauri::generate_context!()) {

@@ -184,6 +184,10 @@ pub fn normalize_preferences(mut preferences: Preferences) -> Preferences {
     if preferences.ghost_hotkey.is_empty() {
         preferences.ghost_hotkey = "Ctrl+Alt+G".into();
     }
+    preferences.ignored_update_version = preferences
+        .ignored_update_version
+        .map(|version| version.trim().chars().take(64).collect::<String>())
+        .filter(|version| !version.is_empty());
     preferences
 }
 

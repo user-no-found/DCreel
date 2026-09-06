@@ -1,6 +1,6 @@
 [package]
 name = "creel-ipc"
-version = "0.1.1"
+version = "0.1.2"
 description = "Small, versioned command protocol shared by DCreel native components"
 edition = "2024"
 license = "Apache-2.0"

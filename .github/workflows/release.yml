@@ -17,6 +17,8 @@ jobs:
       TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -29,11 +31,26 @@ jobs:
 
       - run: npm ci
 
+      - name: Read release notes from tag
+        id: release_notes
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $notes = git for-each-ref "refs/tags/$env:RELEASE_TAG" --format="%(contents)"
+          if ([string]::IsNullOrWhiteSpace($notes)) {
+            $notes = git log -1 --pretty=format:%B
+          }
+          $delimiter = "DCREEL_RELEASE_NOTES_$([guid]::NewGuid().ToString('N'))"
+          "body<<$delimiter" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          $notes | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          $delimiter | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
       - uses: tauri-apps/tauri-action@v1
         with:
           tagName: ${{ github.ref_name }}
           releaseName: DCreel ${{ github.ref_name }}
-          releaseBody: DCreel Windows 安装程序与应用内更新文件。
+          releaseBody: ${{ steps.release_notes.outputs.body }}
           releaseDraft: false
           prerelease: false
           args: --bundles nsis

@@ -1,7 +1,9 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import { flushSync } from "react-dom";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import App from "./App";
-import { writeFrontendLog } from "./lib/bridge";
+import { isTauri, writeFrontendLog } from "./lib/bridge";
 import "./styles.css";
 
 function describeUnknown(value: unknown): string {
@@ -68,10 +70,19 @@ class FrontendErrorBoundary extends React.Component<React.PropsWithChildren, Err
   }
 }
 
-ReactDOM.createRoot(document.getElementById("root")!).render(
+const root = ReactDOM.createRoot(document.getElementById("root")!);
+const render = () => root.render(
   <React.StrictMode>
     <FrontendErrorBoundary>
       <App />
     </FrontendErrorBoundary>
   </React.StrictMode>
 );
+
+// Auxiliary windows start hidden. Mount their listeners without waiting for a
+// browser paint/idle task, since native visibility now waits for a render ACK.
+if (isTauri() && ["desktop-notification", "transfer-progress"].includes(getCurrentWindow().label)) {
+  flushSync(render);
+} else {
+  render();
+}

@@ -1,10 +1,12 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import type {
   Dashboard,
+  DesktopNotificationPayload,
   Fence,
   FencePatch,
   NewFenceInput,
-  Preferences
+  Preferences,
+  TransferSnapshot
 } from "../types";
 
 declare global {
@@ -140,7 +142,8 @@ const browserDashboard: Dashboard = {
     showFenceTitles: true,
     showTrayIcon: true,
     desktopMode: true,
-    desktopContextMenu: true
+    desktopContextMenu: true,
+    ignoredUpdateVersion: null
   },
   desktopVisible: true
 };
@@ -246,4 +249,49 @@ export async function openProjectRepository(): Promise<void> {
 export async function setHotkeyCaptureActive(active: boolean): Promise<void> {
   if (!isTauri()) return;
   await invokeLogged("set_hotkey_capture_active", { active });
+}
+
+export async function ignoreUpdateVersion(version: string): Promise<void> {
+  if (!isTauri()) {
+    mock.preferences.ignoredUpdateVersion = version;
+    return;
+  }
+  await invokeLogged("ignore_update_version", { version });
+}
+
+export async function showUpdateNotification(version: string): Promise<void> {
+  if (!isTauri()) return;
+  await invokeLogged("show_update_notification", { version });
+}
+
+export async function showUpdateDetails(notificationId: string): Promise<void> {
+  if (!isTauri()) return;
+  await invokeLogged("show_update_details", { notificationId });
+}
+
+export async function cancelFileTransfer(id: string): Promise<void> {
+  if (!isTauri()) return;
+  await invokeLogged("cancel_file_transfer", { id });
+}
+
+export async function currentFileTransfer(): Promise<TransferSnapshot | null> {
+  if (!isTauri()) return null;
+  return invokeLogged<TransferSnapshot | null>("current_file_transfer");
+}
+
+export async function dismissAuxiliaryWindow(notificationId?: string): Promise<void> {
+  if (!isTauri()) return;
+  await invokeLogged("dismiss_auxiliary_window", { notificationId });
+}
+
+export async function subscribeDesktopNotifications(onNotification: (notification: DesktopNotificationPayload) => void): Promise<void> {
+  if (!isTauri()) return;
+  const onNotificationChannel = new Channel<DesktopNotificationPayload>();
+  onNotificationChannel.onmessage = onNotification;
+  await invokeLogged("subscribe_desktop_notifications", { onNotification: onNotificationChannel });
+}
+
+export async function presentDesktopNotification(id: string): Promise<void> {
+  if (!isTauri()) return;
+  await invokeLogged("present_desktop_notification", { id });
 }

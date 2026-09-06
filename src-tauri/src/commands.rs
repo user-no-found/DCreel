@@ -13,7 +13,9 @@ use crate::{
 use std::{
     collections::HashSet,
     fs, io,
+    io::{Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_autostart::ManagerExt;
@@ -448,11 +450,38 @@ fn rollback_autostart(app: &AppHandle, enabled: bool) {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImportStage {
+    Preparing,
+    Moving,
+    Finalizing,
+    RollingBack,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ImportProgress {
+    pub stage: ImportStage,
+    pub total_bytes: u64,
+    pub completed_bytes: u64,
+    pub total_items: u64,
+    pub completed_items: u64,
+    pub current_item: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct PathStatistics {
+    bytes: u64,
+    items: u64,
+    complete: bool,
+}
+
 pub(crate) fn import_files_inner(
     fence_id: &str,
     paths: Vec<PathBuf>,
     app: &AppHandle,
     store: &AppStore,
+    cancelled: &AtomicBool,
+    progress: &mut dyn FnMut(ImportProgress),
 ) -> CommandResult<FenceView> {
     let fence = {
         let state = store.lock().map_err(command_error)?;
@@ -467,9 +496,65 @@ pub(crate) fn import_files_inner(
     let canonical_target = fence.directory.canonicalize().map_err(command_error)?;
 
     let plan = plan_file_moves(paths, &canonical_target)?;
-    let mut completed: Vec<PlannedMove> = Vec::with_capacity(plan.len());
-    for planned in plan {
-        if let Err(error) = move_path(&planned.source, &planned.destination) {
+    if plan.is_empty() {
+        return Err("这些项目已经位于该盒子的文件夹中".into());
+    }
+
+    let mut planned = Vec::with_capacity(plan.len());
+    let mut totals = PathStatistics::default();
+    for move_item in plan {
+        ensure_transfer_not_cancelled(cancelled)?;
+        progress(ImportProgress {
+            stage: ImportStage::Preparing,
+            total_bytes: totals.bytes,
+            completed_bytes: 0,
+            total_items: totals.items,
+            completed_items: 0,
+            current_item: Some(move_item.source.clone()),
+        });
+        let statistics = if same_filesystem_root(&move_item.source, &move_item.destination) {
+            PathStatistics {
+                bytes: 0,
+                items: 1,
+                complete: false,
+            }
+        } else {
+            path_statistics(&move_item.source, cancelled).map_err(command_error)?
+        };
+        totals.bytes = totals.bytes.saturating_add(statistics.bytes);
+        totals.items = totals.items.saturating_add(statistics.items);
+        planned.push((move_item, statistics));
+    }
+    let mut transferred = PathStatistics::default();
+    progress(ImportProgress {
+        stage: ImportStage::Moving,
+        total_bytes: totals.bytes,
+        completed_bytes: 0,
+        total_items: totals.items,
+        completed_items: 0,
+        current_item: None,
+    });
+    let mut completed: Vec<PlannedMove> = Vec::with_capacity(planned.len());
+    for (planned, statistics) in planned {
+        let current_source = planned.source.clone();
+        let move_result = move_path_with_progress(
+            &planned.source,
+            &planned.destination,
+            statistics,
+            &mut totals,
+            &mut transferred,
+            cancelled,
+            progress,
+        );
+        if let Err(error) = move_result {
+            progress(ImportProgress {
+                stage: ImportStage::RollingBack,
+                total_bytes: totals.bytes,
+                completed_bytes: transferred.bytes,
+                total_items: totals.items,
+                completed_items: transferred.items,
+                current_item: Some(current_source.clone()),
+            });
             let mut rollback_errors = Vec::new();
             for moved in completed.iter().rev() {
                 if let Err(rollback_error) = move_path(&moved.destination, &moved.source) {
@@ -480,18 +565,18 @@ pub(crate) fn import_files_inner(
             if rollback_errors.is_empty() {
                 return Err(format!(
                     "移动 {} 失败，已撤销本次已经移动的项目：{error}",
-                    planned.source.display()
+                    current_source.display()
                 ));
             }
             log::error!(
                 target: "file_import",
                 "partial rollback failed after moving {}: {}",
-                planned.source.display(),
+                current_source.display(),
                 rollback_errors.join("；")
             );
             return Err(format!(
                 "移动 {} 失败，且有 {} 个项目未能自动移回原处；请查看日志：{error}",
-                planned.source.display(),
+                current_source.display(),
                 rollback_errors.len()
             ));
         }
@@ -500,6 +585,269 @@ pub(crate) fn import_files_inner(
     let view = store.fence_view(&fence).map_err(command_error)?;
     let _ = app.emit("creel://state-changed", ());
     Ok(view)
+}
+
+fn ensure_transfer_not_cancelled(cancelled: &AtomicBool) -> CommandResult<()> {
+    if cancelled.load(Ordering::Acquire) {
+        Err("文件移动已取消".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn path_statistics(path: &Path, cancelled: &AtomicBool) -> io::Result<PathStatistics> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "文件移动已取消"));
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    let mut result = PathStatistics {
+        bytes: if metadata.is_file() {
+            metadata.len()
+        } else {
+            0
+        },
+        items: 1,
+        complete: true,
+    };
+    if metadata.is_dir() {
+        for entry in fs::read_dir(path)? {
+            let child = path_statistics(&entry?.path(), cancelled)?;
+            result.bytes = result.bytes.saturating_add(child.bytes);
+            result.items = result.items.saturating_add(child.items);
+        }
+    }
+    Ok(result)
+}
+
+fn same_filesystem_root(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::path::Component;
+        let root_key = |path: &Path| match path.components().next() {
+            Some(Component::Prefix(prefix)) => {
+                Some(prefix.as_os_str().to_string_lossy().to_lowercase())
+            }
+            Some(Component::RootDir) => Some("\\".into()),
+            _ => None,
+        };
+        root_key(left).is_some_and(|root| Some(root) == root_key(right))
+    }
+
+    #[cfg(not(windows))]
+    {
+        left.components().next() == right.components().next()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn move_path_with_progress(
+    source: &Path,
+    destination: &Path,
+    statistics: PathStatistics,
+    totals: &mut PathStatistics,
+    transferred: &mut PathStatistics,
+    cancelled: &AtomicBool,
+    progress: &mut dyn FnMut(ImportProgress),
+) -> io::Result<()> {
+    if destination.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("目标项目已经存在：{}", destination.display()),
+        ));
+    }
+    if cancelled.load(Ordering::Acquire) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "文件移动已取消"));
+    }
+    if fs::rename(source, destination).is_ok() {
+        transferred.bytes = transferred.bytes.saturating_add(statistics.bytes);
+        transferred.items = transferred.items.saturating_add(statistics.items);
+        emit_import_progress(
+            *totals,
+            *transferred,
+            Some(destination.to_path_buf()),
+            progress,
+        );
+        return Ok(());
+    }
+
+    if !statistics.complete {
+        let actual = path_statistics(source, cancelled)?;
+        totals.bytes = totals
+            .bytes
+            .saturating_add(actual.bytes.saturating_sub(statistics.bytes));
+        totals.items = totals
+            .items
+            .saturating_add(actual.items.saturating_sub(statistics.items));
+        emit_import_progress(*totals, *transferred, Some(source.to_path_buf()), progress);
+    }
+
+    let result = if source.is_dir() {
+        copy_directory_with_progress(
+            source,
+            destination,
+            *totals,
+            transferred,
+            cancelled,
+            progress,
+        )
+    } else {
+        copy_file_with_progress(
+            source,
+            destination,
+            *totals,
+            transferred,
+            cancelled,
+            progress,
+        )
+    };
+    if let Err(error) = result {
+        if destination.is_dir() {
+            let _ = fs::remove_dir_all(destination);
+        } else {
+            let _ = fs::remove_file(destination);
+        }
+        return Err(error);
+    }
+    if cancelled.load(Ordering::Acquire) {
+        if destination.is_dir() {
+            let _ = fs::remove_dir_all(destination);
+        } else {
+            let _ = fs::remove_file(destination);
+        }
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "文件移动已取消"));
+    }
+
+    progress(ImportProgress {
+        stage: ImportStage::Finalizing,
+        total_bytes: totals.bytes,
+        completed_bytes: transferred.bytes.min(totals.bytes),
+        total_items: totals.items,
+        completed_items: transferred.items.min(totals.items),
+        current_item: Some(source.to_path_buf()),
+    });
+
+    let staged_source = match stage_source_for_removal(source) {
+        Ok(staged_source) => staged_source,
+        Err(error) => {
+            if destination.is_dir() {
+                let _ = fs::remove_dir_all(destination);
+            } else {
+                let _ = fs::remove_file(destination);
+            }
+            return Err(error);
+        }
+    };
+    let cleanup = if staged_source.is_dir() {
+        fs::remove_dir_all(&staged_source)
+    } else {
+        fs::remove_file(&staged_source)
+    };
+    if let Err(error) = cleanup {
+        log::warn!(
+            target: "file_import",
+            "moved item but could not remove staged source {}: {error}",
+            staged_source.display()
+        );
+    }
+    Ok(())
+}
+
+fn copy_directory_with_progress(
+    source: &Path,
+    destination: &Path,
+    totals: PathStatistics,
+    transferred: &mut PathStatistics,
+    cancelled: &AtomicBool,
+    progress: &mut dyn FnMut(ImportProgress),
+) -> io::Result<()> {
+    if cancelled.load(Ordering::Acquire) {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "文件移动已取消"));
+    }
+    fs::create_dir(destination)?;
+    transferred.items = transferred.items.saturating_add(1);
+    emit_import_progress(totals, *transferred, Some(source.to_path_buf()), progress);
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let target = destination.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_directory_with_progress(
+                &entry.path(),
+                &target,
+                totals,
+                transferred,
+                cancelled,
+                progress,
+            )?;
+        } else {
+            copy_file_with_progress(
+                &entry.path(),
+                &target,
+                totals,
+                transferred,
+                cancelled,
+                progress,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_file_with_progress(
+    source: &Path,
+    destination: &Path,
+    totals: PathStatistics,
+    transferred: &mut PathStatistics,
+    cancelled: &AtomicBool,
+    progress: &mut dyn FnMut(ImportProgress),
+) -> io::Result<()> {
+    let mut source_file = fs::File::open(source)?;
+    let mut destination_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(destination)?;
+    let result = (|| -> io::Result<()> {
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        loop {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "文件移动已取消"));
+            }
+            let read = source_file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            destination_file.write_all(&buffer[..read])?;
+            transferred.bytes = transferred.bytes.saturating_add(read as u64);
+            emit_import_progress(totals, *transferred, Some(source.to_path_buf()), progress);
+        }
+        destination_file.sync_all()?;
+        if let Ok(metadata) = source_file.metadata() {
+            fs::set_permissions(destination, metadata.permissions())?;
+        }
+        transferred.items = transferred.items.saturating_add(1);
+        emit_import_progress(totals, *transferred, Some(source.to_path_buf()), progress);
+        Ok(())
+    })();
+    drop(destination_file);
+    if result.is_err() {
+        let _ = fs::remove_file(destination);
+    }
+    result
+}
+
+fn emit_import_progress(
+    totals: PathStatistics,
+    transferred: PathStatistics,
+    current_item: Option<PathBuf>,
+    progress: &mut dyn FnMut(ImportProgress),
+) {
+    progress(ImportProgress {
+        stage: ImportStage::Moving,
+        total_bytes: totals.bytes,
+        completed_bytes: transferred.bytes.min(totals.bytes),
+        total_items: totals.items,
+        completed_items: transferred.items.min(totals.items),
+        current_item,
+    });
 }
 
 #[derive(Debug)]
@@ -845,6 +1193,51 @@ mod tests {
         );
         assert_eq!(fs::read(&destination).unwrap(), b"existing content");
         assert_eq!(fs::read(&source).unwrap(), b"new content");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn transfer_statistics_include_nested_items_and_file_bytes() {
+        let root = std::env::temp_dir().join(format!("dcreel-stats-{}", Uuid::new_v4()));
+        let nested = root.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(root.join("one.bin"), b"1234").unwrap();
+        fs::write(nested.join("two.bin"), b"567890").unwrap();
+
+        let statistics = path_statistics(&root, &AtomicBool::new(false)).unwrap();
+
+        assert_eq!(statistics.items, 4);
+        assert_eq!(statistics.bytes, 10);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cancelled_progress_copy_removes_the_partial_destination() {
+        let root = std::env::temp_dir().join(format!("dcreel-cancel-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("source.bin");
+        let destination = root.join("destination.bin");
+        fs::write(&source, vec![7_u8; 32 * 1024]).unwrap();
+        let mut transferred = PathStatistics::default();
+        let cancelled = AtomicBool::new(true);
+
+        let error = copy_file_with_progress(
+            &source,
+            &destination,
+            PathStatistics {
+                bytes: 32 * 1024,
+                items: 1,
+                complete: true,
+            },
+            &mut transferred,
+            &cancelled,
+            &mut |_| {},
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(source.exists());
+        assert!(!destination.exists());
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,6 +1,7 @@
 import {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -8,7 +9,9 @@ import {
   type KeyboardEvent
 } from "react";
 import {
+  AlertCircle,
   AppWindow,
+  Bell,
   Boxes,
   Check,
   ChevronDown,
@@ -44,6 +47,7 @@ import {
   X
 } from "lucide-react";
 import { getVersion } from "@tauri-apps/api/app";
+import { flushSync } from "react-dom";
 import { open } from "@tauri-apps/plugin-dialog";
 import { check, type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
 import { listen } from "@tauri-apps/api/event";
@@ -51,7 +55,12 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   createMappedBox,
   createStorageBox,
+  cancelFileTransfer,
   completeStartup,
+  currentFileTransfer,
+  subscribeDesktopNotifications,
+  presentDesktopNotification,
+  dismissAuxiliaryWindow,
   deleteFence,
   isTauri,
   loadDashboard,
@@ -62,15 +71,26 @@ import {
   quitApplication,
   saveFence,
   savePreferences,
+  ignoreUpdateVersion,
   setDesktopVisibility,
   setHotkeyCaptureActive,
+  showUpdateDetails,
+  showUpdateNotification,
   takePendingNavigation,
   waitForBackendReady,
   writeFrontendLog
 } from "./lib/bridge";
 import { basename, formatBytes } from "./lib/format";
 import { clearMatchingPatch, mergeDashboardWithOptimistic } from "./lib/stateSync";
-import type { Dashboard, Fence, FencePatch, Preferences } from "./types";
+import { WindowStartup } from "./components/WindowStartup";
+import type {
+  Dashboard,
+  DesktopNotificationPayload,
+  Fence,
+  FencePatch,
+  Preferences,
+  TransferSnapshot
+} from "./types";
 
 type View = "desktop" | "settings" | "about";
 type Modal = "new" | null;
@@ -148,15 +168,188 @@ function SplashScreen() {
   );
 }
 
+function DesktopNotificationWindow() {
+  const [notification, setNotification] = useState<DesktopNotificationPayload | null>(null);
+
+  useLayoutEffect(() => {
+    let disposed = false;
+    void subscribeDesktopNotifications((payload) => {
+      if (disposed) return;
+      flushSync(() => setNotification(payload));
+    }).catch((error) => {
+      void writeFrontendLog("error", `通知监听失败：${errorMessage(error)}`, "notification").catch(() => undefined);
+    });
+    return () => { disposed = true; };
+  }, []);
+
+  useLayoutEffect(() => {
+    // Hidden WebViews can postpone paint/passive effects. A layout effect runs
+    // immediately after the DOM commit, without requiring the window to show first.
+    if (notification) void presentDesktopNotification(notification.id).catch(() => undefined);
+  }, [notification?.id]);
+
+  if (!notification) return null;
+  const isUpdate = notification.kind === "update" && Boolean(notification.version);
+  return (
+    <section className="desktop-notification" role="status" aria-live="polite">
+      <div className={`desktop-notification-icon ${isUpdate ? "update" : "warning"}`}>
+        {isUpdate ? <Download /> : <AlertCircle />}
+      </div>
+      <div className="desktop-notification-copy">
+        <b>{notification.title}</b>
+        <p>{notification.message}</p>
+        {isUpdate && (
+          <div className="desktop-notification-actions">
+            <button
+              className="notification-primary"
+              onClick={() => void showUpdateDetails(notification.id).catch(() => undefined)}
+            >
+              查看更新
+            </button>
+            <button
+              onClick={() => {
+                const version = notification.version;
+                if (!version) return;
+                void ignoreUpdateVersion(version)
+                  .then(() => dismissAuxiliaryWindow(notification.id))
+                  .catch(() => undefined);
+              }}
+            >
+              不再提醒此版本
+            </button>
+          </div>
+        )}
+      </div>
+      <button
+        className="desktop-notification-close"
+        aria-label="关闭通知"
+        title="关闭通知"
+        onClick={() => void dismissAuxiliaryWindow(notification.id).catch(() => undefined)}
+      >
+        <X />
+      </button>
+    </section>
+  );
+}
+
+function TransferProgressWindow() {
+  const [transfer, setTransfer] = useState<TransferSnapshot | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+
+  useEffect(() => {
+    let dispose: (() => void) | undefined;
+    let disposed = false;
+    let receivedProgress = false;
+    void listen<TransferSnapshot>("creel://transfer-progress", ({ payload }) => {
+      if (disposed) return;
+      receivedProgress = true;
+      setTransfer(payload);
+      setCancelling(false);
+    }).then((unlisten) => {
+      if (disposed) {
+        unlisten();
+        return;
+      }
+      dispose = unlisten;
+      // Subscribe first so a completion during the initial query cannot be lost
+      // or overwritten by an older snapshot (including StrictMode remounts).
+      void currentFileTransfer().then((snapshot) => {
+        if (!disposed && !receivedProgress) setTransfer(snapshot);
+      }).catch(() => undefined);
+    }).catch(() => undefined);
+    return () => {
+      disposed = true;
+      dispose?.();
+    };
+  }, []);
+
+  // Native task completion owns the 3-second dismissal, independent of WebView
+  // timer throttling and guarded against the next transfer replacing this one.
+
+  if (!transfer) return null;
+  const determinate = ["moving", "finalizing", "completed"].includes(transfer.phase);
+  const fraction = transfer.totalBytes > 0
+    ? transfer.completedBytes / transfer.totalBytes
+    : transfer.totalItems > 0
+      ? transfer.completedItems / transfer.totalItems
+      : 0;
+  const percentage = Math.max(0, Math.min(100, Math.round(fraction * 100)));
+  const terminal = ["completed", "cancelled", "failed"].includes(transfer.phase);
+  const phaseTitle: Record<TransferSnapshot["phase"], string> = {
+    queued: "准备移动",
+    preparing: "正在统计文件",
+    moving: "正在移动文件",
+    finalizing: "正在完成移动",
+    rolling_back: "正在安全撤销",
+    completed: "移动完成",
+    cancelled: "移动已取消",
+    failed: "移动失败"
+  };
+
+  return (
+    <section className={`transfer-window phase-${transfer.phase}`} role="status" aria-live="polite">
+      <header>
+        <div>
+          <FolderInput />
+          <span><b>{phaseTitle[transfer.phase]}</b><small>移入「{transfer.fenceTitle}」</small></span>
+        </div>
+        <button
+          aria-label="收起文件移动窗口"
+          title="收起"
+          onClick={() => void dismissAuxiliaryWindow().catch(() => undefined)}
+        >
+          <Minus />
+        </button>
+      </header>
+      <div className={`transfer-progress ${determinate ? "" : "indeterminate"}`}>
+        <span style={determinate ? { width: `${percentage}%` } : undefined} />
+      </div>
+      <div className="transfer-summary">
+        <b>{transfer.message}</b>
+        <span>
+          {determinate
+            ? transfer.totalBytes > 0
+              ? `${formatBytes(transfer.completedBytes)} / ${formatBytes(transfer.totalBytes)} · ${percentage}%`
+              : `${transfer.completedItems} / ${transfer.totalItems} 个项目`
+            : "正在读取文件夹内容…"}
+        </span>
+      </div>
+      <p className="transfer-current" title={transfer.currentItem ?? undefined}>
+        {transfer.currentItem ?? (terminal ? "任务已经结束" : "请稍候…")}
+      </p>
+      <footer>
+        <span>{transfer.totalItems > 0 ? `${transfer.completedItems} / ${transfer.totalItems} 个项目` : ""}</span>
+        {transfer.canCancel && !terminal ? (
+          <button
+            disabled={cancelling}
+            onClick={() => {
+              setCancelling(true);
+              void cancelFileTransfer(transfer.id).catch(() => setCancelling(false));
+            }}
+          >
+            {cancelling ? "正在取消…" : "取消移动"}
+          </button>
+        ) : (
+          <button onClick={() => void dismissAuxiliaryWindow().catch(() => undefined)}>关闭</button>
+        )}
+      </footer>
+    </section>
+  );
+}
+
 export default function App() {
   const windowLabel = isTauri() ? getCurrentWindow().label : "main";
-  return windowLabel === "splash" ? <SplashScreen /> : <DCreelApp />;
+  if (windowLabel === "splash") return <SplashScreen />;
+  if (windowLabel === "desktop-notification") return <DesktopNotificationWindow />;
+  if (windowLabel === "transfer-progress") return <TransferProgressWindow />;
+  return <DCreelApp />;
 }
 
 function DCreelApp() {
   const isNewBoxWindow = isTauri() && getCurrentWindow().label === "new-box";
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadAttempt, setLoadAttempt] = useState(0);
   const [view, setView] = useState<View>("desktop");
   const [modal, setModal] = useState<Modal>(null);
   const [search, setSearch] = useState("");
@@ -168,11 +361,14 @@ function DCreelApp() {
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [windowMaximized, setWindowMaximized] = useState(false);
-  const [appVersion, setAppVersion] = useState("0.1.1");
+  const [appVersion, setAppVersion] = useState("0.1.2");
   const [updater, setUpdater] = useState<UpdaterState>(initialUpdaterState);
   const dashboardRef = useRef<Dashboard | null>(null);
   const availableUpdateRef = useRef<Update | null>(null);
-  const autoUpdateStarted = useRef(false);
+  const updateCheckInFlight = useRef(false);
+  const lastUpdateCheckAt = useRef(0);
+  const lastUpdateCheckFailed = useRef(false);
+  const notifiedUpdateVersion = useRef<string | null>(null);
   const preferenceTimer = useRef<number | undefined>(undefined);
   const folderRefreshTimer = useRef<number | undefined>(undefined);
   const preferenceBufferedRef = useRef<Partial<Preferences>>({});
@@ -235,13 +431,19 @@ function DCreelApp() {
     return () => {
       disposed = true;
     };
-  }, [isNewBoxWindow, refresh]);
+  }, [isNewBoxWindow, refresh, loadAttempt]);
 
   const checkForUpdates = useCallback(async (manual: boolean) => {
     if (!isTauri()) {
       setUpdater({ ...initialUpdaterState, phase: "current" });
-      return;
+      return true;
     }
+    if (updateCheckInFlight.current) {
+      if (manual) setToast("正在检查更新，请稍候");
+      return false;
+    }
+    updateCheckInFlight.current = true;
+    lastUpdateCheckAt.current = Date.now();
     setUpdater({ ...initialUpdaterState, phase: "checking" });
     void writeFrontendLog("info", `Update check started manual=${manual}`, "updater").catch(
       () => undefined
@@ -257,7 +459,8 @@ function DCreelApp() {
           () => undefined
         );
         if (manual) setToast("当前已是最新版本");
-        return;
+        lastUpdateCheckFailed.current = false;
+        return true;
       }
       availableUpdateRef.current = next;
       setUpdater({
@@ -271,7 +474,20 @@ function DCreelApp() {
         `Update available current=${next.currentVersion} available=${next.version}`,
         "updater"
       ).catch(() => undefined);
-      if (manual) setToast(`发现新版本 ${next.version}`);
+      lastUpdateCheckFailed.current = false;
+      if (manual) {
+        setToast(`发现新版本 ${next.version}`);
+      } else if (notifiedUpdateVersion.current !== next.version) {
+        notifiedUpdateVersion.current = next.version;
+        void showUpdateNotification(next.version).catch((error) => {
+          void writeFrontendLog(
+            "warn",
+            `Unable to show update notification: ${errorMessage(error)}`,
+            "updater"
+          ).catch(() => undefined);
+        });
+      }
+      return true;
     } catch (error) {
       const message = errorMessage(error);
       setUpdater({ ...initialUpdaterState, phase: "error", error: message });
@@ -279,6 +495,10 @@ function DCreelApp() {
         () => undefined
       );
       if (manual) setToast(`检查更新失败：${message}`);
+      lastUpdateCheckFailed.current = true;
+      return false;
+    } finally {
+      updateCheckInFlight.current = false;
     }
   }, []);
 
@@ -327,6 +547,11 @@ function DCreelApp() {
       setToast("更新信息已失效，请重新检查");
       return;
     }
+    const transfer = await currentFileTransfer().catch(() => null);
+    if (transfer && !["completed", "cancelled", "failed"].includes(transfer.phase)) {
+      setToast("文件仍在移动，请等待完成或安全取消后再安装更新");
+      return;
+    }
     setUpdater((state) => ({ ...state, phase: "installing" }));
     void writeFrontendLog("info", `Update install started version=${update.version}`, "updater").catch(
       () => undefined
@@ -360,13 +585,28 @@ function DCreelApp() {
   const desktopVisible = dashboard?.desktopVisible ?? true;
 
   useEffect(() => {
-    if (!dashboardReady || isNewBoxWindow || autoUpdateStarted.current || !isTauri()) return;
-    const timer = window.setTimeout(() => {
-      if (autoUpdateStarted.current) return;
-      autoUpdateStarted.current = true;
+    if (!dashboardReady || isNewBoxWindow || !isTauri()) return;
+    const automaticInterval = 6 * 60 * 60 * 1_000;
+    const retryInterval = 15 * 60 * 1_000;
+    const maybeCheck = () => {
+      if (availableUpdateRef.current || updateCheckInFlight.current) return;
+      const requiredAge = lastUpdateCheckFailed.current ? retryInterval : automaticInterval;
+      if (lastUpdateCheckAt.current && Date.now() - lastUpdateCheckAt.current < requiredAge) return;
       void checkForUpdates(false);
-    }, 4_000);
-    return () => window.clearTimeout(timer);
+    };
+    const startupTimer = window.setTimeout(maybeCheck, 4_000);
+    const interval = window.setInterval(maybeCheck, 5 * 60 * 1_000);
+    let disposeFocus: (() => void) | undefined;
+    void getCurrentWindow().onFocusChanged(({ payload }) => {
+      if (payload) maybeCheck();
+    }).then((dispose) => {
+      disposeFocus = dispose;
+    });
+    return () => {
+      window.clearTimeout(startupTimer);
+      window.clearInterval(interval);
+      disposeFocus?.();
+    };
   }, [checkForUpdates, dashboardReady, isNewBoxWindow]);
 
   useEffect(
@@ -418,16 +658,20 @@ function DCreelApp() {
 
   useEffect(() => {
     if (!isTauri()) return;
+    let disposed = false;
     let disposeState: (() => void) | undefined;
     let disposeNavigate: (() => void) | undefined;
     let disposeFolder: (() => void) | undefined;
     let disposeNotification: (() => void) | undefined;
+    let receivedNavigation = false;
     if (!isNewBoxWindow) {
       void listen("creel://state-changed", () => void refresh()).then((dispose) => {
+        if (disposed) { dispose(); return; }
         disposeState = dispose;
       });
     }
     const navigate = (payload: string | null) => {
+      if (disposed) return;
       if (payload === "new-storage-box") {
         setView("desktop");
         setNewKind("storage");
@@ -444,40 +688,54 @@ function DCreelApp() {
         setNewColor("sage");
         setNewContentColor("paper");
         setModal("new");
+      } else if (payload === "about") {
+        setView("about");
       }
     };
     void listen<string>("creel://navigate", ({ payload }) => {
+      if (disposed) return;
+      receivedNavigation = true;
       navigate(payload);
       if (payload === "new-storage-box" || payload === "new-mapped-box") {
-        void takePendingNavigation();
+        void takePendingNavigation().catch(() => undefined);
       }
     }).then(async (dispose) => {
+      if (disposed) { dispose(); return; }
       disposeNavigate = dispose;
       if (isNewBoxWindow) {
-        navigate(await takePendingNavigation());
+        await waitForBackendReady();
+        if (!disposed) {
+          const pending = await takePendingNavigation();
+          if (!receivedNavigation) navigate(pending);
+        }
       }
+    }).catch((error) => {
+      if (!disposed && isNewBoxWindow) setLoadError(`新建窗口未能就绪：${errorMessage(error)}`);
     });
     if (!isNewBoxWindow) {
       void listen("creel://folder-changed", () => {
         window.clearTimeout(folderRefreshTimer.current);
         folderRefreshTimer.current = window.setTimeout(() => void refresh(), 180);
       }).then((dispose) => {
+        if (disposed) { dispose(); return; }
         disposeFolder = dispose;
       });
       void listen<string>("creel://notification", ({ payload }) => setToast(payload)).then(
         (dispose) => {
+          if (disposed) { dispose(); return; }
           disposeNotification = dispose;
         }
       );
     }
     return () => {
+      disposed = true;
       disposeState?.();
       disposeNavigate?.();
       disposeFolder?.();
       disposeNotification?.();
       window.clearTimeout(folderRefreshTimer.current);
     };
-  }, [isNewBoxWindow, refresh]);
+  }, [isNewBoxWindow, refresh, loadAttempt]);
 
   useEffect(() => {
     dashboardRef.current = dashboard;
@@ -593,9 +851,10 @@ function DCreelApp() {
   };
 
   const dismissNewFence = () => {
-    setModal(null);
     if (isNewBoxWindow) {
-      void getCurrentWindow().hide();
+      void getCurrentWindow().hide().catch((error) => setToast(errorMessage(error)));
+    } else {
+      setModal(null);
     }
   };
 
@@ -713,23 +972,24 @@ function DCreelApp() {
     if (!dashboard) return 0;
     return dashboard.fences.reduce((sum, fence) => sum + fence.itemCount, 0);
   }, [dashboard]);
+  const updateVisible = Boolean(updater.availableVersion) && [
+    "available",
+    "downloading",
+    "downloaded",
+    "installing"
+  ].includes(updater.phase);
 
-  if (!dashboard) {
-    if (isNewBoxWindow) return null;
+  if (!dashboard || (isNewBoxWindow && modal === null)) {
     return (
-      <div className={`boot-screen ${loadError ? "failed" : ""}`}>
-        {loadError ? (
-          <div className="startup-error">
-            <b>DCreel 无法读取本地配置</b>
-            <span>{loadError}</span>
-            <button className="button secondary" onClick={() => void openLogDirectory()}>
-              <FolderOpen /> 打开日志目录
-            </button>
-          </div>
-        ) : (
-          <div className="boot-spinner" />
-        )}
-      </div>
+      <WindowStartup
+        title={isNewBoxWindow ? "DCreel · 新建盒子" : "DCreel 正在启动"}
+        error={loadError}
+        onRetry={() => { setLoadError(null); setLoadAttempt((attempt) => attempt + 1); }}
+        onClose={() => {
+          void getCurrentWindow().close().catch((error) => setLoadError(`无法关闭窗口：${errorMessage(error)}`));
+        }}
+        onOpenLogs={() => void openLogDirectory().catch((error) => setLoadError(`无法打开日志：${errorMessage(error)}`))}
+      />
     );
   }
 
@@ -786,12 +1046,13 @@ function DCreelApp() {
             </button>
           </nav>
           <button
-            className={`help-button ${view === "about" ? "active" : ""}`}
+            className={`help-button ${view === "about" ? "active" : ""} ${updateVisible ? "has-update" : ""}`}
             onClick={() => setView("about")}
             title="关于 DCreel"
           >
             <CircleHelp />
             <span>关于</span>
+            {updateVisible && <i aria-label="有可用更新" />}
           </button>
         </aside>
 
@@ -864,6 +1125,25 @@ function DCreelApp() {
               </div>
             )}
           </header>
+
+          {updateVisible && (
+            <button className="global-update-notice" onClick={() => setView("about")}>
+              <Bell />
+              <span>
+                <b>DCreel {updater.availableVersion} 可以更新</b>
+                <small>
+                  {updater.phase === "downloaded"
+                    ? "更新已下载，点击安装"
+                    : updater.phase === "downloading"
+                      ? "正在下载，点击查看进度"
+                      : updater.phase === "installing"
+                        ? "正在启动更新安装程序"
+                        : "点击查看版本说明并下载"}
+                </small>
+              </span>
+              <ChevronRight />
+            </button>
+          )}
 
           {view === "desktop" && (
             <FenceManagerView

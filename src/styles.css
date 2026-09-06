@@ -193,6 +193,18 @@ input:focus-visible {
   transition: color 150ms ease, background 150ms ease, transform 150ms ease;
 }
 
+.help-button.has-update i {
+  position: absolute;
+  top: 8px;
+  right: 17px;
+  width: 7px;
+  height: 7px;
+  background: #d5634c;
+  border: 2px solid #e4e0d7;
+  border-radius: 50%;
+  box-sizing: content-box;
+}
+
 .sidebar nav button:hover,
 .help-button:hover {
   color: var(--ink);
@@ -281,6 +293,56 @@ input:focus-visible {
   margin-left: 12px;
   color: #918c84;
   font-size: 11px;
+}
+
+.global-update-notice {
+  width: calc(100% - 60px);
+  min-height: 48px;
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) 16px;
+  align-items: center;
+  gap: 10px;
+  margin: 14px 30px 0;
+  padding: 8px 13px;
+  color: #5c4b43;
+  text-align: left;
+  background: linear-gradient(90deg, #fff4e9, #f7f1e8);
+  border: 1px solid rgba(199, 94, 73, 0.25);
+  border-radius: 11px;
+  box-shadow: 0 4px 13px rgba(76, 58, 44, 0.07);
+  cursor: pointer;
+}
+
+.global-update-notice > svg:first-child {
+  width: 17px;
+  height: 17px;
+  padding: 6px;
+  color: #b94e39;
+  background: rgba(223, 118, 93, 0.13);
+  border-radius: 8px;
+  box-sizing: content-box;
+}
+
+.global-update-notice > svg:last-child {
+  width: 14px;
+  color: #a17768;
+}
+
+.global-update-notice span {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.global-update-notice b {
+  font-size: 11px;
+}
+
+.global-update-notice small {
+  color: #897970;
+  font-size: 9px;
 }
 
 .header-actions {
@@ -1587,6 +1649,231 @@ input:focus-visible {
   color: #a9c6a9;
 }
 
+.desktop-notification,
+.transfer-window {
+  width: calc(100% - 16px);
+  height: calc(100% - 16px);
+  margin: 8px;
+  color: #48433c;
+  background: rgba(255, 252, 245, 0.98);
+  border: 1px solid rgba(83, 70, 58, 0.16);
+  border-radius: 14px;
+  box-shadow: 0 14px 38px rgba(34, 31, 27, 0.28);
+}
+
+.desktop-notification {
+  position: relative;
+  display: grid;
+  grid-template-columns: 42px minmax(0, 1fr) 24px;
+  align-items: start;
+  gap: 12px;
+  padding: 18px 14px 15px 17px;
+  overflow-y: auto;
+}
+
+.desktop-notification-icon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  color: #b15240;
+  background: #f9e6df;
+  border-radius: 11px;
+}
+
+.desktop-notification-icon.update {
+  color: #52785c;
+  background: #e5efe5;
+}
+
+.desktop-notification-icon svg {
+  width: 20px;
+  height: 20px;
+}
+
+.desktop-notification-copy {
+  min-width: 0;
+}
+
+.desktop-notification-copy > b {
+  display: block;
+  margin: 1px 0 5px;
+  font-size: 12px;
+}
+
+.desktop-notification-copy > p {
+  min-height: 30px;
+  margin: 0;
+  color: #766f65;
+  font-size: 10px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.desktop-notification-close,
+.transfer-window header > button {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  color: #8e877d;
+  background: transparent;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.desktop-notification-close:hover,
+.transfer-window header > button:hover {
+  color: #4e4942;
+  background: rgba(70, 63, 54, 0.07);
+}
+
+.desktop-notification-close svg,
+.transfer-window header > button svg {
+  width: 14px;
+}
+
+.desktop-notification-actions {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 10px;
+}
+
+.desktop-notification-actions button,
+.transfer-window footer button {
+  height: 28px;
+  padding: 0 10px;
+  color: #686159;
+  font-size: 9px;
+  font-weight: 800;
+  background: #f6f1e8;
+  border: 1px solid rgba(67, 59, 51, 0.13);
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.desktop-notification-actions button.notification-primary {
+  color: #fffaf4;
+  background: #bf5945;
+  border-color: #ad4c3a;
+}
+
+.transfer-window {
+  display: flex;
+  flex-direction: column;
+  padding: 15px 17px 13px;
+}
+
+.transfer-window header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+}
+
+.transfer-window header > div {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.transfer-window header > div > svg {
+  width: 19px;
+  color: #bd5945;
+}
+
+.transfer-window header span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.transfer-window header b {
+  font-size: 12px;
+}
+
+.transfer-window header small {
+  color: #91897f;
+  font-size: 9px;
+}
+
+.transfer-progress {
+  height: 7px;
+  margin: 15px 0 10px;
+  overflow: hidden;
+  background: #e8e2d8;
+  border-radius: 6px;
+}
+
+.transfer-progress span {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #d36a52, #df8a72);
+  border-radius: inherit;
+  transition: width 90ms linear;
+}
+
+.transfer-progress.indeterminate span {
+  width: 28%;
+  animation: transfer-indeterminate 1.15s ease-in-out infinite;
+}
+
+.phase-completed .transfer-progress span {
+  background: #759779;
+}
+
+.phase-failed .transfer-progress span,
+.phase-cancelled .transfer-progress span {
+  background: #b95a49;
+}
+
+.transfer-summary {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: #746d64;
+  font-size: 9px;
+}
+
+.transfer-summary b {
+  min-width: 0;
+  overflow: hidden;
+  color: #5c554d;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transfer-current {
+  margin: 9px 0 0;
+  overflow: hidden;
+  color: #9a9187;
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.transfer-window footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: auto;
+  padding-top: 9px;
+  border-top: 1px solid rgba(71, 63, 54, 0.08);
+}
+
+.transfer-window footer > span {
+  color: #928a80;
+  font-size: 9px;
+}
+
+.transfer-window footer button:disabled {
+  opacity: 0.55;
+  cursor: wait;
+}
+
 .boot-screen {
   width: 100%;
   height: 100%;
@@ -1595,6 +1882,32 @@ input:focus-visible {
   justify-content: center;
   background: transparent;
 }
+
+.window-startup {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.window-startup-card {
+  position: relative;
+  width: min(470px, 100%);
+  max-height: 100%;
+  overflow: auto;
+  padding: 28px 24px;
+  color: var(--ink);
+  background: var(--paper);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+}
+
+.window-startup-card h2 { margin: 0 30px 18px 0; font-size: 16px; }
+.window-startup-error { font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; user-select: text; }
+.window-startup-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
+.window-startup-loading { display: flex; align-items: center; gap: 10px; font-size: 12px; }
+.window-startup-loading svg { width: 18px; }
 
 .boot-screen.failed {
   background: var(--paper);
@@ -1676,6 +1989,10 @@ input:focus-visible {
 @keyframes fade-in { from { opacity: 0; } }
 @keyframes modal-in { from { opacity: 0; transform: translateY(8px) scale(0.98); } }
 @keyframes toast-in { from { opacity: 0; transform: translate(-50%, 8px); } }
+@keyframes transfer-indeterminate {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(360%); }
+}
 
 @media (max-width: 1100px) {
   .page-header { padding-left: 22px; padding-right: 20px; }

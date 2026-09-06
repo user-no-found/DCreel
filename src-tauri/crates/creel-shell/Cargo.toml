@@ -1,6 +1,6 @@
 [package]
 name = "creel-shell"
-version = "0.1.1"
+version = "0.1.2"
 description = "Minimal Rust Explorer command extension for DCreel"
 edition = "2024"
 license = "Apache-2.0"

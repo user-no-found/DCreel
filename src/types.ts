@@ -62,6 +62,38 @@ export interface Preferences {
   showTrayIcon: boolean;
   desktopMode: boolean;
   desktopContextMenu: boolean;
+  ignoredUpdateVersion?: string | null;
+}
+
+export type TransferPhase =
+  | "queued"
+  | "preparing"
+  | "moving"
+  | "finalizing"
+  | "rolling_back"
+  | "completed"
+  | "cancelled"
+  | "failed";
+
+export interface TransferSnapshot {
+  id: string;
+  fenceTitle: string;
+  phase: TransferPhase;
+  totalBytes: number;
+  completedBytes: number;
+  totalItems: number;
+  completedItems: number;
+  currentItem?: string | null;
+  message?: string | null;
+  canCancel: boolean;
+}
+
+export interface DesktopNotificationPayload {
+  id: string;
+  kind: "message" | "update";
+  title: string;
+  message: string;
+  version?: string;
 }
 
 export interface Dashboard {

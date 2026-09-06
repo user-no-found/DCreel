@@ -1,4 +1,7 @@
-use crate::{models::PersistedState, store::AppStore};
+use crate::{
+    desktop_notifications, file_transfers::FileTransferManager, models::PersistedState,
+    store::AppStore,
+};
 use tauri::AppHandle;
 
 #[cfg(windows)]
@@ -65,10 +68,6 @@ mod platform {
     }
 
     enum NativeRequest {
-        ImportFiles {
-            fence_id: String,
-            paths: Vec<PathBuf>,
-        },
         UserAction(HostUserAction),
     }
 
@@ -508,16 +507,8 @@ mod platform {
                     let _ = request_app.emit("creel://notification", "DCreel 状态尚未就绪");
                     continue;
                 };
-                let result = match request {
-                    NativeRequest::ImportFiles { fence_id, paths } => {
-                        crate::commands::import_files_inner(&fence_id, paths, &request_app, &store)
-                            .map(|view| Some(format!("已移入「{}」", view.config.title)))
-                            .map_err(|error| format!("文件拖入失败：{error}"))
-                    }
-                    NativeRequest::UserAction(action) => {
-                        apply_user_action(&request_app, store, action)
-                    }
-                };
+                let NativeRequest::UserAction(action) = request;
+                let result = apply_user_action(&request_app, store, action);
                 match result {
                     Ok(Some(message)) => {
                         let _ = request_app.emit("creel://notification", message);
@@ -537,6 +528,11 @@ mod platform {
                 });
                 if let Ok(HostEvent::Notification { message }) = &event {
                     let _ = callback_app.emit("creel://notification", message.clone());
+                    desktop_notifications::show_message(
+                        &callback_app,
+                        "DCreel 无法完成操作",
+                        message.clone(),
+                    );
                     continue;
                 }
                 if let Ok(HostEvent::DesktopVisibilityChanged { visible }) = &event {
@@ -577,15 +573,29 @@ mod platform {
                     continue;
                 }
                 if let Ok(HostEvent::ImportFiles { fence_id, paths }) = &event {
-                    if request_sender
-                        .send(NativeRequest::ImportFiles {
-                            fence_id: fence_id.clone(),
-                            paths: paths.clone(),
-                        })
-                        .is_err()
-                    {
-                        let _ = callback_app
-                            .emit("creel://notification", "桌面盒子的文件拖入服务已停止");
+                    let enqueue = callback_app
+                        .try_state::<FileTransferManager>()
+                        .ok_or_else(|| "文件移动服务尚未就绪".to_string())
+                        .and_then(|transfers| {
+                            let store = callback_app.state::<AppStore>();
+                            let title = store
+                                .lock()
+                                .map_err(|error| error.to_string())?
+                                .fences
+                                .iter()
+                                .find(|fence| fence.id == *fence_id)
+                                .map(|fence| fence.title.clone())
+                                .ok_or_else(|| format!("没有找到盒子：{fence_id}"))?;
+                            transfers.enqueue(fence_id.clone(), title, paths.clone())
+                        });
+                    if let Err(error) = enqueue {
+                        let message = format!("无法开始文件移动：{error}");
+                        let _ = callback_app.emit("creel://notification", &message);
+                        desktop_notifications::show_message(
+                            &callback_app,
+                            "DCreel 文件移动",
+                            message,
+                        );
                     }
                     continue;
                 }
