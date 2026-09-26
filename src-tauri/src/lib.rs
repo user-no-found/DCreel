@@ -4,10 +4,14 @@ mod desktop_host;
 mod desktop_notifications;
 mod desktop_windows;
 mod diagnostics;
+mod directory_identity;
 mod directory_watchers;
 mod file_transfers;
 mod models;
+mod startup_recovery;
 mod store;
+#[cfg(windows)]
+mod windows_directory_identity;
 
 use creel_ipc::{ExternalCommand, parse_external_commands};
 use std::{
@@ -427,6 +431,9 @@ pub fn run() {
         .setup(move |app| {
             log::info!(target: "startup", "Tauri setup started");
             let store = AppStore::load(app.handle())?;
+            // 先找回关闭期间被改名/移动的映射，再管理状态、启动 Desktop Host
+            // 与目录监听，保证 UI 和桌面第一次读到的就是恢复后的配置。
+            startup_recovery::recover_at_startup(&store);
             let context_menu_enabled = store
                 .lock()
                 .map(|state| state.preferences.desktop_context_menu)

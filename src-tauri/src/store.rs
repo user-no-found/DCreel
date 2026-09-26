@@ -58,6 +58,17 @@ impl AppStore {
         self.inner.lock().map_err(|_| CreelError::StatePoisoned)
     }
 
+    /// 用独立目录构造一份真实落盘的状态存储，供跨模块测试使用。
+    #[cfg(test)]
+    pub fn in_directory(root: &Path) -> io::Result<Self> {
+        fs::create_dir_all(root)?;
+        Ok(Self {
+            inner: Mutex::new(PersistedState::default()),
+            config_path: root.join("state.json"),
+            desktop_visible: AtomicBool::new(true),
+        })
+    }
+
     pub fn save(&self, state: &PersistedState) -> CreelResult<()> {
         write_state(&self.config_path, state)
     }
@@ -117,7 +128,11 @@ pub fn dashboard_from_state(state: &PersistedState, desktop_visible: bool) -> Da
 
 fn fence_to_view(config: FenceConfig, show_hidden: bool) -> FenceView {
     let item_count = count_directory_items(&config.directory, show_hidden).unwrap_or_default();
-    FenceView { config, item_count }
+    FenceView {
+        directory_available: config.directory.is_dir(),
+        config,
+        item_count,
+    }
 }
 
 fn count_directory_items(directory: &Path, show_hidden: bool) -> CreelResult<usize> {
@@ -376,7 +391,7 @@ fn load_current_state(path: &Path) -> CreelResult<Option<PersistedState>> {
     Ok(Some(serde_json::from_slice(&content)?))
 }
 
-fn load_state_with_recovery(path: &Path) -> CreelResult<PersistedState> {
+pub(crate) fn load_state_with_recovery(path: &Path) -> CreelResult<PersistedState> {
     match load_current_state(path) {
         Ok(Some(state)) => return Ok(state),
         Ok(None) if !path.exists() => {
@@ -596,6 +611,7 @@ mod tests {
             locked: false,
             display_anchor: None,
             placement: None,
+            directory_identity: None,
         };
         assert_eq!(next_position(&[], 330.0, 280.0), (34.0, 38.0));
         assert_eq!(next_position(&[occupied], 330.0, 280.0), (390.0, 38.0));
@@ -617,6 +633,7 @@ mod tests {
             locked: false,
             display_anchor: None,
             placement: None,
+            directory_identity: None,
         };
 
         assert!(apply_fence_geometry(

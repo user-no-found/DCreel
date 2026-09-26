@@ -1,7 +1,7 @@
 use crate::{
     desktop_context_menu,
     desktop_host::DesktopHostController,
-    directory_watchers,
+    directory_identity, directory_watchers,
     models::{
         Dashboard, FenceConfig, FencePatch, FenceView, NewFenceInput, Preferences, PreferencesPatch,
     },
@@ -128,6 +128,8 @@ fn create_fence(
     store: &AppStore,
 ) -> CommandResult<FenceView> {
     let directory = directory.canonicalize().map_err(command_error)?;
+    // 新建映射就采集目录身份，之后关闭期间被改名或同卷移动才能在启动时找回。
+    let directory_identity = directory_identity::capture_identity(&directory);
     let fence = {
         let mut state = store.lock().map_err(command_error)?;
         if let Some(existing) = state
@@ -154,6 +156,7 @@ fn create_fence(
             locked: false,
             display_anchor: None,
             placement: None,
+            directory_identity,
         });
         state.fences.push(fence.clone());
         if let Err(error) = store.save(&state) {

@@ -72,7 +72,7 @@ DCreel 对磁盘操作采用保守约定：
 - 可正常链接 Windows MSVC 目标的 Rust stable 和 Cargo（当前机器已验证）。
 - WebView2 Runtime（Windows 11 通常已经内置）。
 
-工程没有 C++ 源码，也不调用 C++ 编译器。Win32、COM、Shell Extension 和 Desktop Host 都通过 Rust `windows` crate 直接使用 Windows ABI。
+Win32、COM、Shell Extension 和 Desktop Host 都通过 Rust `windows` crate 直接使用 Windows ABI。
 
 安装依赖并运行浏览器 UI 预览：
 

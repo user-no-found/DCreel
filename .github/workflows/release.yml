@@ -37,7 +37,12 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          $notes = git for-each-ref "refs/tags/$env:RELEASE_TAG" --format="%(contents)"
+          # 强制 UTF-8，避免非 UTF-8 控制台将中文标签正文误解码为乱码。
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          # checkout 在 tag 事件下可能只建轻量标签，导致 %(contents) 为空并回退成 commit message；
+          # 这里强制抓取带注释标签对象，保证读到标签正文作为更新详情。
+          git fetch --force origin "refs/tags/${env:RELEASE_TAG}:refs/tags/${env:RELEASE_TAG}"
+          $notes = git for-each-ref "refs/tags/${env:RELEASE_TAG}" --format="%(contents)"
           if ([string]::IsNullOrWhiteSpace($notes)) {
             $notes = git log -1 --pretty=format:%B
           }

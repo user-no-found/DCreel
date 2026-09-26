@@ -1323,7 +1323,11 @@ function FenceManagerView({
                   <h3>{fence.title}</h3>
                   {fence.locked && <Lock />}
                 </div>
-                <p>文件夹映射 · {fence.itemCount} 个项目</p>
+                <p>
+                  {fence.directoryAvailable
+                    ? `文件夹映射 · ${fence.itemCount} 个项目`
+                    : "文件夹映射已失效 · 请重新指定文件夹"}
+                </p>
                 <span title={fence.directory}>{fence.directory}</span>
               </div>
               <div className="manager-card-actions">

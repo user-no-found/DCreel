@@ -38,7 +38,8 @@ const dashboard: Dashboard = {
       contentColor: "paper",
       collapsed: false,
       locked: false,
-      itemCount: 42
+      itemCount: 42,
+      directoryAvailable: true
     }
   ]
 };

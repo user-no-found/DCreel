@@ -94,7 +94,8 @@ const browserDashboard: Dashboard = {
       contentColor: "paper",
       collapsed: false,
       locked: false,
-      itemCount: 2
+      itemCount: 2,
+      directoryAvailable: true
     },
     {
       id: "projects",
@@ -108,7 +109,8 @@ const browserDashboard: Dashboard = {
       contentColor: "frosted",
       collapsed: false,
       locked: false,
-      itemCount: 3
+      itemCount: 3,
+      directoryAvailable: true
     },
     {
       id: "inspiration",
@@ -122,7 +124,8 @@ const browserDashboard: Dashboard = {
       contentColor: "paper",
       collapsed: false,
       locked: false,
-      itemCount: 0
+      itemCount: 0,
+      directoryAvailable: true
     }
   ],
   preferences: {
@@ -164,7 +167,8 @@ function mockFence(input: NewFenceInput, directory: string): Fence {
     contentColor: input.contentColor,
     collapsed: false,
     locked: false,
-    itemCount: 0
+    itemCount: 0,
+    directoryAvailable: true
   };
 }
 

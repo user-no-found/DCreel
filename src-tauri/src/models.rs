@@ -1,3 +1,4 @@
+use crate::directory_identity::DirectoryIdentity;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -126,6 +127,9 @@ pub struct FenceConfig {
     pub display_anchor: Option<DisplayAnchor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<FencePlacement>,
+    /// 旧配置没有这个字段时保持 None，由启动采集补齐。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_identity: Option<DirectoryIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +163,8 @@ pub struct FenceView {
     #[serde(flatten)]
     pub config: FenceConfig,
     pub item_count: usize,
+    /// 目录当前是否还能作为文件夹打开；失效时界面按缺失展示。
+    pub directory_available: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

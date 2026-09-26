@@ -38,6 +38,7 @@ export interface Fence {
   displayAnchor?: DisplayAnchor | null;
   placement?: FencePlacement | null;
   itemCount: number;
+  directoryAvailable: boolean;
 }
 
 export type FencePatch = Partial<
