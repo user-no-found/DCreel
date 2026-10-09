@@ -982,11 +982,13 @@ pub fn open_project_repository() -> CommandResult<()> {
 }
 
 #[tauri::command]
-pub fn set_hotkey_capture_active(
-    active: bool,
-    host: State<'_, DesktopHostController>,
-) -> CommandResult<()> {
-    host.set_hotkey_capture_active(active)
+pub async fn set_hotkey_capture_active(active: bool, app: AppHandle) -> CommandResult<()> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<DesktopHostController>()
+            .set_hotkey_capture_active(active)
+    })
+    .await
+    .map_err(|error| format!("快捷键捕获任务失败：{error}"))?
 }
 
 fn normalized_title(title: &str) -> CommandResult<String> {

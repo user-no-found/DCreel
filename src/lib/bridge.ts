@@ -250,9 +250,15 @@ export async function openProjectRepository(): Promise<void> {
   await invokeLogged("open_project_repository");
 }
 
+let hotkeyCaptureQueue: Promise<void> = Promise.resolve();
+
 export async function setHotkeyCaptureActive(active: boolean): Promise<void> {
   if (!isTauri()) return;
-  await invokeLogged("set_hotkey_capture_active", { active });
+  const request = hotkeyCaptureQueue
+    .catch(() => undefined)
+    .then(() => invokeLogged<void>("set_hotkey_capture_active", { active }));
+  hotkeyCaptureQueue = request;
+  await request;
 }
 
 export async function ignoreUpdateVersion(version: string): Promise<void> {

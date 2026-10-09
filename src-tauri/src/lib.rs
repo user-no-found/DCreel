@@ -64,6 +64,9 @@ fn shutdown_desktop_integration(app: &tauri::AppHandle) {
     if let Some(host) = app.try_state::<desktop_host::DesktopHostController>() {
         host.shutdown();
     }
+    if let Some(watchers) = app.try_state::<directory_watchers::DirectoryWatchers>() {
+        watchers.shutdown();
+    }
 }
 
 pub(crate) fn quit_application(app: &tauri::AppHandle) {

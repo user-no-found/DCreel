@@ -80,6 +80,15 @@ mod platform {
                     None
                 }
             };
+            Self::with_executable(app, executable)
+        }
+
+        #[cfg(test)]
+        pub(crate) fn without_host_for_test(app: &AppHandle) -> Self {
+            Self::with_executable(app, None)
+        }
+
+        fn with_executable(app: &AppHandle, executable: Option<PathBuf>) -> Self {
             Self {
                 inner: Mutex::new(ControllerState {
                     executable,
@@ -290,6 +299,13 @@ mod platform {
                 &mut running.stdin,
                 &HostCommand::SetHotkeyCapture { active },
             )
+        }
+
+        #[cfg(test)]
+        pub(crate) fn with_control_locked_for_test(&self, action: impl FnOnce()) {
+            let controller = self.inner.lock().unwrap();
+            action();
+            drop(controller);
         }
 
         fn host_requires_sync(&self) -> bool {

@@ -8,6 +8,8 @@ use super::*;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use tauri::WebviewWindowBuilder;
 
+#[path = "file_transfer_window_test/hotkey_settings.rs"]
+mod hotkey_settings;
 #[path = "file_transfer_window_test/notifications.rs"]
 mod notifications;
 #[path = "file_transfer_window_test/shortcut_notifications.rs"]
@@ -18,6 +20,7 @@ use support::*;
 
 struct FixtureState {
     fail_dashboard: AtomicBool,
+    preferences: Mutex<crate::models::Preferences>,
 }
 
 struct ProbeLogger;
@@ -48,9 +51,20 @@ fn load_dashboard(
     }
     Ok(crate::models::Dashboard {
         fences: Vec::new(),
-        preferences: Default::default(),
+        preferences: fixture.preferences.lock().unwrap().clone(),
         desktop_visible: true,
     })
+}
+
+#[tauri::command]
+fn update_preferences(
+    patch: crate::models::PreferencesPatch,
+    fixture: tauri::State<'_, FixtureState>,
+) -> crate::models::Preferences {
+    let mut preferences = fixture.preferences.lock().unwrap();
+    patch.apply_to(&mut preferences);
+    *preferences = crate::store::normalize_preferences(preferences.clone());
+    preferences.clone()
 }
 
 fn begin(app: &AppHandle, state: &Arc<Mutex<TransferState>>, id: &str) {
@@ -236,6 +250,7 @@ fn exercise(app: &AppHandle, state: &Arc<Mutex<TransferState>>) {
     println!(
         "PASS: failed new-box loading remains closable; retry restores form without real configuration"
     );
+    hotkey_settings::exercise(app);
 }
 
 #[test]
@@ -257,7 +272,7 @@ fn native_progress_window_lifecycle() {
     configs.retain(|window| {
         matches!(
             window.label.as_str(),
-            "desktop-notification" | PROGRESS_WINDOW | "new-box"
+            "desktop-notification" | PROGRESS_WINDOW | "new-box" | "main"
         )
     });
     // Build the notification last and send immediately, without waiting for its
@@ -269,10 +284,16 @@ fn native_progress_window_lifecycle() {
         .manage(desktop_notifications::NotificationManager::default())
         .manage(FixtureState {
             fail_dashboard: AtomicBool::new(true),
+            preferences: Mutex::new(crate::models::Preferences {
+                ghost_mode: true,
+                ghost_mode_trigger: crate::models::GhostModeTrigger::Hotkey,
+                ..Default::default()
+            }),
         })
         .manage(crate::PendingNavigation(Mutex::new(Some(
             "new-storage-box".into(),
         ))))
+        .manage(crate::StartupController::new(false))
         .on_window_event(crate::handle_window_event)
         .on_page_load(|webview, payload| {
             if matches!(payload.event(), tauri::webview::PageLoadEvent::Started)
@@ -290,11 +311,19 @@ fn native_progress_window_lifecycle() {
             desktop_notifications::present_desktop_notification,
             desktop_notifications::delete_notification_shortcut,
             backend_ready,
+            crate::complete_startup,
             load_dashboard,
+            update_preferences,
+            crate::commands::set_hotkey_capture_active,
             crate::take_pending_navigation,
         ])
         .setup(move |app| {
-            for config in configs {
+            app.manage(
+                crate::desktop_host::DesktopHostController::without_host_for_test(app.handle()),
+            );
+            for mut config in configs {
+                config.focus = false;
+                config.skip_taskbar = true;
                 let window = WebviewWindowBuilder::from_config(app, &config)?
                     .data_directory(probe_directory.join(&config.label))
                     .build()?;
