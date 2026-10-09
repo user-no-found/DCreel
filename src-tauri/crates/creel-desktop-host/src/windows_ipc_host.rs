@@ -1,7 +1,10 @@
+use crate::shell_open::open_shell_path;
+use crate::shell_visuals::{ShellVisualKind, VisualCacheEntry};
 use creel_ipc::{
     DisplayAnchor, FencePlacement, GhostModeTrigger, HostCommand, HostEvent, HostFenceSnapshot,
     HostPreferencesSnapshot, HostUserAction, LayoutAnchor, LayoutAxis, PROTOCOL_VERSION,
 };
+use creel_shell_operations::shell_path;
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
@@ -26,22 +29,20 @@ use windows::{
             OLE_E_ADVISENOTSUPPORTED, POINT, POINTL, RECT, S_OK, SIZE, WPARAM,
         },
         Graphics::Gdi::{
-            AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, AlphaBlend, BI_RGB, BITMAP, BITMAPINFO,
+            AC_SRC_ALPHA, AC_SRC_OVER, ANTIALIASED_QUALITY, AlphaBlend, BI_RGB, BITMAPINFO,
             BITMAPINFOHEADER, BLENDFUNCTION, BeginPaint, ClientToScreen, CreateCompatibleDC,
             CreateDIBSection, CreateFontIndirectW, CreateSolidBrush, DEFAULT_GUI_FONT,
             DIB_RGB_COLORS, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
             DT_VCENTER, DeleteDC, DeleteObject, DrawFocusRect, DrawTextW, EndPaint,
-            EnumDisplayMonitors, FillRect, GdiFlush, GetDIBits, GetMonitorInfoW, GetObjectW,
-            GetStockObject, HBITMAP, HFONT, HGDIOBJ, HMONITOR, InvalidateRect, LOGFONTW,
-            MONITOR_DEFAULTTONEAREST, MONITORINFOEXW, MonitorFromRect, PAINTSTRUCT, SRCCOPY,
-            ScreenToClient, SelectObject, SetBkMode, SetTextColor, StretchBlt, TRANSPARENT,
-            UpdateWindow,
+            EnumDisplayMonitors, FillRect, GdiFlush, GetMonitorInfoW, GetStockObject, HBITMAP,
+            HFONT, HGDIOBJ, HMONITOR, InvalidateRect, LOGFONTW, MONITOR_DEFAULTTONEAREST,
+            MONITORINFOEXW, MonitorFromRect, PAINTSTRUCT, SRCCOPY, ScreenToClient, SelectObject,
+            SetBkMode, SetTextColor, StretchBlt, TRANSPARENT, UpdateWindow,
         },
         System::{
             Com::{
-                CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree, DATADIR_GET,
-                DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject, IDataObject_Impl,
-                IEnumFORMATETC, IEnumSTATDATA, IPersistFile, STGM_READ, STGMEDIUM, STGMEDIUM_0,
+                CoTaskMemFree, DATADIR_GET, DVASPECT_CONTENT, FORMATETC, IAdviseSink, IDataObject,
+                IDataObject_Impl, IEnumFORMATETC, IEnumSTATDATA, STGMEDIUM, STGMEDIUM_0,
                 TYMED_HGLOBAL,
             },
             LibraryLoader::GetModuleHandleW,
@@ -67,10 +68,8 @@ use windows::{
             Shell::{
                 CMF_CANRENAME, CMF_NORMAL, CMIC_MASK_PTINVOKE, CMINVOKECOMMANDINFO,
                 CMINVOKECOMMANDINFOEX, Common::ITEMIDLIST, DROPFILES, DragQueryFileW, HDROP,
-                IContextMenu, IContextMenu2, IContextMenu3, IShellFolder, IShellItemImageFactory,
-                IShellLinkW, SHBindToParent, SHCreateItemFromParsingName, SHCreateStdEnumFmtEtc,
-                SHParseDisplayName, SIIGBF, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
-                SIIGBF_THUMBNAILONLY, ShellExecuteW, ShellLink,
+                IContextMenu, IContextMenu2, IContextMenu3, IShellFolder, SHBindToParent,
+                SHCreateStdEnumFmtEtc, SHParseDisplayName,
             },
             WindowsAndMessaging::{
                 AppendMenuW, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, CREATESTRUCTW, CS_DBLCLKS,
@@ -249,7 +248,7 @@ struct FenceState {
     snapshot: HostFenceSnapshot,
     preferences: HostPreferencesSnapshot,
     items: Vec<FolderItem>,
-    visuals: HashMap<VisualKey, Option<CachedBitmap>>,
+    visuals: HashMap<VisualKey, VisualCacheEntry>,
     interaction: Option<WindowInteraction>,
     item_drag: Option<ItemDragCandidate>,
     scroll_row: usize,
@@ -1623,28 +1622,6 @@ struct FolderItem {
 struct VisualKey {
     path: PathBuf,
     size: u32,
-}
-
-struct CachedBitmap {
-    handle: HBITMAP,
-    width: i32,
-    height: i32,
-    kind: ShellVisualKind,
-    uses_alpha: bool,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ShellVisualKind {
-    Thumbnail,
-    Icon,
-}
-
-impl Drop for CachedBitmap {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(self.handle.0));
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3609,9 +3586,7 @@ unsafe fn handle_fence_keydown(window: HWND, key: WPARAM) -> bool {
         }
         for path in paths {
             if let Err(error) = open_shell_path(window, &path) {
-                emit_event(&HostEvent::Notification {
-                    message: format!("无法打开 {}：{error}", path.display()),
-                });
+                emit_event(&error.notification(&path));
             }
         }
         return true;
@@ -4640,6 +4615,13 @@ unsafe fn refresh_fence(window: HWND, force: bool) {
             state.visuals.clear();
             changed = true;
         }
+        if state
+            .visuals
+            .values()
+            .any(|entry| entry.retry_due(Instant::now()))
+        {
+            changed = true;
+        }
         if items != state.items {
             let existing_paths: HashSet<&Path> =
                 items.iter().map(|item| item.path.as_path()).collect();
@@ -4981,11 +4963,15 @@ unsafe fn draw_fence_surface(
                 size: icon_size,
             };
             visible_visuals.insert(key.clone());
-            let visual = state
+            let now = Instant::now();
+            let entry = state
                 .visuals
                 .entry(key)
-                .or_insert_with(|| extract_shell_visual(&item.path, icon_size));
-            if let Some(visual) = visual.as_ref() {
+                .or_insert_with(|| VisualCacheEntry::load(&item.path, icon_size, now));
+            if entry.retry_due(now) {
+                *entry = VisualCacheEntry::load(&item.path, icon_size, now);
+            }
+            if let Some(visual) = entry.bitmap.as_ref() {
                 // Draw shell visuals after the panel Alpha has been applied. Drawing
                 // them onto the opaque panel first permanently mixes the panel color
                 // into anti-aliased icon edges and leaves a pale fringe when the panel
@@ -5245,10 +5231,7 @@ fn composite_reconstructed_pixel(
     white: &[u8],
     surface_alpha: u8,
 ) {
-    let blue_alpha = 255u8.saturating_sub(white[0].saturating_sub(black[0]));
-    let green_alpha = 255u8.saturating_sub(white[1].saturating_sub(black[1]));
-    let red_alpha = 255u8.saturating_sub(white[2].saturating_sub(black[2]));
-    let content_alpha = blue_alpha.max(green_alpha).max(red_alpha);
+    let content_alpha = crate::shell_visuals::bitmap::reconstructed_alpha(black, white);
     if content_alpha == 0 {
         return;
     }
@@ -5848,7 +5831,12 @@ unsafe fn show_item_fallback_menu(
         "在文件资源管理器中显示",
     )?;
     match track_popup_menu(window, menu.0, screen_point) {
-        ITEM_MENU_OPEN => open_shell_path(window, &item.path),
+        ITEM_MENU_OPEN => {
+            if let Err(error) = open_shell_path(window, &item.path) {
+                emit_event(&error.notification(&item.path));
+            }
+            Ok(())
+        }
         ITEM_MENU_REVEAL => reveal_shell_path(&item.path),
         _ => Ok(()),
     }
@@ -5883,10 +5871,10 @@ unsafe fn shell_context_menu(window: HWND, paths: &[PathBuf]) -> Result<IContext
         if path.parent() != Some(first_parent) {
             return Err("Explorer 多选菜单要求所有项目位于同一文件夹".into());
         }
-        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let wide = shell_path(path);
         let mut absolute_pidl = std::ptr::null_mut();
         SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut absolute_pidl, 0, None)
-            .map_err(display_windows_error)?;
+            .map_err(|error| format!("解析 Shell 项目失败（SHParseDisplayName）：{error}"))?;
         if absolute_pidl.is_null() {
             return Err(format!(
                 "Windows Shell 没有返回项目标识符：{}",
@@ -5896,7 +5884,7 @@ unsafe fn shell_context_menu(window: HWND, paths: &[PathBuf]) -> Result<IContext
         let absolute_pidl = OwnedPidl(absolute_pidl);
         let mut child_pidl = std::ptr::null_mut();
         let parent: IShellFolder = SHBindToParent(absolute_pidl.0, Some(&mut child_pidl))
-            .map_err(display_windows_error)?;
+            .map_err(|error| format!("绑定 Shell 父目录失败（SHBindToParent）：{error}"))?;
         if child_pidl.is_null() {
             return Err(format!(
                 "Windows Shell 没有返回父目录中的项目标识符：{}",
@@ -5912,7 +5900,7 @@ unsafe fn shell_context_menu(window: HWND, paths: &[PathBuf]) -> Result<IContext
     let shell_parent = shell_parent.ok_or_else(|| "Windows Shell 父目录无效".to_string())?;
     let context_menu = shell_parent
         .GetUIObjectOf::<IContextMenu>(window, &child_pidls, None)
-        .map_err(display_windows_error)?;
+        .map_err(|error| format!("获取 Shell 菜单失败（GetUIObjectOf）：{error}"))?;
     drop(absolute_pidls);
     Ok(context_menu)
 }
@@ -5947,7 +5935,7 @@ unsafe fn invoke_shell_verb(window: HWND, paths: &[PathBuf], verb: &str) -> Resu
     };
     let result = context_menu
         .InvokeCommand((&invocation as *const CMINVOKECOMMANDINFOEX).cast::<CMINVOKECOMMANDINFO>())
-        .map_err(display_windows_error);
+        .map_err(|error| format!("执行 Shell 操作 {verb} 失败（InvokeCommand）：{error}"));
     refresh_fence(window, true);
     result
 }
@@ -6064,7 +6052,7 @@ unsafe fn show_box_menu(
             None
         }
         FENCE_MENU_OPEN => {
-            open_shell_path(window, &snapshot.directory)?;
+            open_shell_path(window, &snapshot.directory).map_err(|error| error.message)?;
             None
         }
         FENCE_MENU_RENAME => prompt_rename(
@@ -6483,312 +6471,9 @@ unsafe fn open_fence_item_at(window: HWND, point: POINT) -> bool {
         return false;
     };
     if let Err(error) = open_shell_path(window, &path) {
-        emit_event(&HostEvent::Notification {
-            message: format!("无法打开 {}：{error}", path.display()),
-        });
+        emit_event(&error.notification(&path));
     }
     true
-}
-
-unsafe fn open_shell_path(window: HWND, path: &Path) -> Result<(), String> {
-    if !path.exists() {
-        return Err("文件或文件夹已经不存在".into());
-    }
-    if let Some(target) = unavailable_shortcut_target(path)? {
-        return Err(format!(
-            "快捷方式指向的文件已不存在或暂时无法访问：{}",
-            target.display()
-        ));
-    }
-    let operation: Vec<u16> = "open".encode_utf16().chain(Some(0)).collect();
-    let target: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let result = ShellExecuteW(
-        Some(window),
-        PCWSTR(operation.as_ptr()),
-        PCWSTR(target.as_ptr()),
-        PCWSTR::null(),
-        PCWSTR::null(),
-        SW_SHOWNORMAL,
-    );
-    let code = result.0 as isize;
-    if code <= 32 {
-        Err(format!("Windows Shell 返回错误码 {code}"))
-    } else {
-        Ok(())
-    }
-}
-
-unsafe fn unavailable_shortcut_target(path: &Path) -> Result<Option<PathBuf>, String> {
-    let is_shortcut = path
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("lnk"));
-    if !is_shortcut {
-        return Ok(None);
-    }
-    let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
-        .map_err(|error| format!("无法读取快捷方式：{error}"))?;
-    let persisted: IPersistFile = link
-        .cast()
-        .map_err(|error| format!("无法读取快捷方式：{error}"))?;
-    let shortcut: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    persisted
-        .Load(PCWSTR(shortcut.as_ptr()), STGM_READ)
-        .map_err(|error| format!("快捷方式文件已损坏或无法读取：{error}"))?;
-    let mut target = vec![0_u16; MAX_DROP_PATH_CHARS as usize + 1];
-    link.GetPath(&mut target, std::ptr::null_mut(), 0)
-        .map_err(|error| format!("无法读取快捷方式目标：{error}"))?;
-    let length = target
-        .iter()
-        .position(|value| *value == 0)
-        .unwrap_or(target.len());
-    if length == 0 {
-        // Windows 也支持只保存 PIDL 等 Shell 标识的快捷方式。这类快捷方式
-        // 没有普通文件路径，继续交给 ShellExecuteW 处理，不能误判为失效。
-        return Ok(None);
-    }
-    let target = PathBuf::from(OsString::from_wide(&target[..length]));
-    Ok((!target.exists()).then_some(target))
-}
-
-fn thumbnail_candidate(path: &Path) -> bool {
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    matches!(
-        extension.as_str(),
-        "png"
-            | "jpg"
-            | "jpeg"
-            | "jpe"
-            | "gif"
-            | "webp"
-            | "bmp"
-            | "tif"
-            | "tiff"
-            | "heic"
-            | "heif"
-            | "avif"
-            | "ico"
-            | "svg"
-            | "psd"
-            | "raw"
-            | "dng"
-            | "mp4"
-            | "m4v"
-            | "mov"
-            | "mkv"
-            | "avi"
-            | "wmv"
-            | "webm"
-            | "mpg"
-            | "mpeg"
-            | "mp3"
-            | "m4a"
-            | "flac"
-            | "wav"
-            | "wma"
-            | "ogg"
-            | "pdf"
-    )
-}
-
-fn extract_shell_visual(path: &Path, size: u32) -> Option<CachedBitmap> {
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    let factory: IShellItemImageFactory =
-        unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None) }.ok()?;
-    let requested_size = SIZE {
-        cx: size as i32,
-        cy: size as i32,
-    };
-    if path.is_file()
-        && thumbnail_candidate(path)
-        && let Some(thumbnail) = extract_factory_bitmap(
-            &factory,
-            requested_size,
-            SIIGBF_THUMBNAILONLY | SIIGBF_BIGGERSIZEOK,
-            ShellVisualKind::Thumbnail,
-        )
-    {
-        return Some(thumbnail);
-    }
-    extract_factory_bitmap(
-        &factory,
-        requested_size,
-        SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
-        ShellVisualKind::Icon,
-    )
-}
-
-fn extract_factory_bitmap(
-    factory: &IShellItemImageFactory,
-    requested_size: SIZE,
-    flags: SIIGBF,
-    kind: ShellVisualKind,
-) -> Option<CachedBitmap> {
-    let bitmap = unsafe { factory.GetImage(requested_size, flags) }.ok()?;
-    if bitmap.0.is_null() {
-        return None;
-    }
-    let mut details = BITMAP::default();
-    let copied = unsafe {
-        GetObjectW(
-            HGDIOBJ(bitmap.0),
-            std::mem::size_of::<BITMAP>() as i32,
-            Some((&mut details as *mut BITMAP).cast::<c_void>()),
-        )
-    };
-    if copied == 0 || details.bmWidth <= 0 || details.bmHeight == 0 {
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(bitmap.0));
-        }
-        return None;
-    }
-    let width = details.bmWidth;
-    let height = details.bmHeight.unsigned_abs();
-    let (bitmap, uses_alpha) = normalize_shell_bitmap(bitmap, width, height);
-    Some(CachedBitmap {
-        handle: bitmap,
-        width,
-        height: height as i32,
-        kind,
-        uses_alpha,
-    })
-}
-
-fn normalize_shell_bitmap(bitmap: HBITMAP, width: i32, height: u32) -> (HBITMAP, bool) {
-    let Some(mut pixels) = read_bitmap_pixels(bitmap, width, height) else {
-        return (bitmap, false);
-    };
-    let uses_alpha = normalize_shell_bgra(&mut pixels);
-    if !uses_alpha {
-        return (bitmap, false);
-    }
-    let Some(normalized) = create_bgra_bitmap(width, height, &pixels) else {
-        return (bitmap, true);
-    };
-    unsafe {
-        let _ = DeleteObject(HGDIOBJ(bitmap.0));
-    }
-    (normalized, true)
-}
-
-fn read_bitmap_pixels(bitmap: HBITMAP, width: i32, height: u32) -> Option<Vec<u8>> {
-    let Ok(width) = u32::try_from(width) else {
-        return None;
-    };
-    let Ok(height_i32) = i32::try_from(height) else {
-        return None;
-    };
-    let byte_count = width
-        .checked_mul(height)
-        .and_then(|pixels| pixels.checked_mul(4))
-        .and_then(|bytes| usize::try_from(bytes).ok())?;
-    if byte_count > 64 * 1024 * 1024 {
-        return None;
-    }
-    let Ok(image_size) = u32::try_from(byte_count) else {
-        return None;
-    };
-    let mut pixels = vec![0_u8; byte_count];
-    let mut bitmap_info = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: width as i32,
-            biHeight: -height_i32,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            biSizeImage: image_size,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let dc = unsafe { CreateCompatibleDC(None) };
-    if dc.0.is_null() {
-        return None;
-    }
-    let lines = unsafe {
-        GetDIBits(
-            dc,
-            bitmap,
-            0,
-            height,
-            Some(pixels.as_mut_ptr().cast::<c_void>()),
-            &mut bitmap_info,
-            DIB_RGB_COLORS,
-        )
-    };
-    unsafe {
-        let _ = DeleteDC(dc);
-    }
-    (lines == height_i32).then_some(pixels)
-}
-
-fn normalize_shell_bgra(pixels: &mut [u8]) -> bool {
-    let pixels = pixels.as_chunks_mut::<4>().0;
-    let uses_alpha = pixels.iter().any(|pixel| pixel[3] != 0);
-    if !uses_alpha {
-        return false;
-    }
-    // IShellItemImageFactory 返回的 HBITMAP 在不同图标处理器之间并不完全
-    // 一致：有些是预乘 Alpha，有些是直通 Alpha，还有一些会在 alpha=0 的
-    // 像素里留下未初始化的 RGB。AlphaBlend 要求预乘 Alpha，后两种情况会把
-    // 透明边缘画成青色、红色或黑色细条。
-    let straight_alpha = pixels.iter().any(|pixel| {
-        let alpha = pixel[3];
-        alpha > 0 && alpha < 255 && pixel[..3].iter().any(|channel| *channel > alpha)
-    });
-    for pixel in pixels {
-        let alpha = pixel[3];
-        if alpha == 0 {
-            pixel[..3].fill(0);
-        } else if alpha < 255 && straight_alpha {
-            for channel in &mut pixel[..3] {
-                *channel = ((u16::from(*channel) * u16::from(alpha) + 127) / 255) as u8;
-            }
-        }
-    }
-    true
-}
-
-fn create_bgra_bitmap(width: i32, height: u32, pixels: &[u8]) -> Option<HBITMAP> {
-    let height_i32 = i32::try_from(height).ok()?;
-    let expected = usize::try_from(width)
-        .ok()?
-        .checked_mul(usize::try_from(height).ok()?)?
-        .checked_mul(4)?;
-    if pixels.len() != expected {
-        return None;
-    }
-    let bitmap_info = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: width,
-            biHeight: -height_i32,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            biSizeImage: u32::try_from(expected).ok()?,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let mut bits = std::ptr::null_mut::<c_void>();
-    let bitmap =
-        unsafe { CreateDIBSection(None, &bitmap_info, DIB_RGB_COLORS, &mut bits, None, 0) }.ok()?;
-    if bits.is_null() {
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(bitmap.0));
-        }
-        return None;
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits.cast::<u8>(), pixels.len());
-    }
-    Some(bitmap)
 }
 
 unsafe fn draw_visual_overlay(
@@ -7874,7 +7559,41 @@ mod tests {
     fn missing_item_is_rejected_before_shell_execute() {
         let path = std::env::temp_dir().join("creel-host-definitely-missing-item.test");
         let error = unsafe { open_shell_path(HWND::default(), &path) }.unwrap_err();
-        assert!(error.contains("不存在"));
+        assert!(error.message.contains("不存在"));
+    }
+
+    #[test]
+    fn canonical_file_reaches_the_shell_delete_menu() {
+        let _apartment = ComApartment::initialize().unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "dcreel-shell-menu-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("selected.txt");
+        std::fs::write(&path, b"temporary menu fixture").unwrap();
+        let canonical = std::fs::canonicalize(&path).unwrap();
+        unsafe {
+            let context = shell_context_menu(HWND::default(), &[canonical]).unwrap();
+            let menu = PopupMenu(CreatePopupMenu().unwrap());
+            context
+                .QueryContextMenu(
+                    menu.0,
+                    0,
+                    SHELL_MENU_ID_FIRST,
+                    SHELL_MENU_ID_LAST,
+                    CMF_NORMAL,
+                )
+                .ok()
+                .unwrap();
+        }
+        // No verb is invoked: this probes the original Delete-key preparation.
+        assert!(path.exists());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -8408,14 +8127,6 @@ mod tests {
     }
 
     #[test]
-    fn thumbnail_extensions_are_case_insensitive() {
-        assert!(thumbnail_candidate(Path::new("poster.JPEG")));
-        assert!(thumbnail_candidate(Path::new("clip.MP4")));
-        assert!(thumbnail_candidate(Path::new("document.PDF")));
-        assert!(!thumbnail_candidate(Path::new("notes.txt")));
-    }
-
-    #[test]
     fn file_drop_data_object_round_trips_unicode_paths() {
         let _apartment = ComApartment::initialize().unwrap();
         let expected = vec![
@@ -8438,58 +8149,5 @@ mod tests {
             ..file_drop_format()
         };
         assert!(!accepts_file_drop_format(&format));
-    }
-
-    #[test]
-    fn shell_bitmap_alpha_normalization_clears_garbage_and_premultiplies_straight_edges() {
-        let mut straight = vec![
-            255, 64, 32, 0, // 完全透明像素中的垃圾 RGB
-            200, 100, 50, 128, // 直通 Alpha，通道值可以大于 Alpha
-            30, 20, 10, 255,
-        ];
-        assert!(normalize_shell_bgra(&mut straight));
-        assert_eq!(&straight[0..4], &[0, 0, 0, 0]);
-        assert_eq!(&straight[4..8], &[100, 50, 25, 128]);
-        assert_eq!(&straight[8..12], &[30, 20, 10, 255]);
-
-        let mut premultiplied = vec![100, 50, 25, 128, 9, 8, 7, 0];
-        assert!(normalize_shell_bgra(&mut premultiplied));
-        assert_eq!(&premultiplied[0..4], &[100, 50, 25, 128]);
-        assert_eq!(&premultiplied[4..8], &[0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn windows_shell_exposes_a_real_bitmap_for_the_host_binary() {
-        let _apartment = ComApartment::initialize().unwrap();
-        let executable = std::env::current_exe().unwrap();
-        let bitmap = extract_shell_visual(&executable, 48)
-            .expect("Windows Shell should expose the test executable icon");
-        assert_eq!(bitmap.kind, ShellVisualKind::Icon);
-        assert!(bitmap.width > 0);
-        assert!(bitmap.height > 0);
-        if bitmap.uses_alpha {
-            let pixels =
-                read_bitmap_pixels(bitmap.handle, bitmap.width, bitmap.height.unsigned_abs())
-                    .expect("normalized icon pixels should remain readable");
-            assert!(pixels.as_chunks::<4>().0.iter().all(|pixel| {
-                pixel[3] != 0 || (pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 0)
-            }));
-        }
-    }
-
-    #[test]
-    fn windows_shell_exposes_the_project_image_thumbnail() {
-        let _apartment = ComApartment::initialize().unwrap();
-        let image = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::parent)
-            .expect("workspace root should exist")
-            .join("Creel .png");
-        let bitmap = extract_shell_visual(&image, 64)
-            .expect("Windows Shell should expose the project PNG thumbnail");
-        assert_eq!(bitmap.kind, ShellVisualKind::Thumbnail);
-        assert!(bitmap.width > 0);
-        assert!(bitmap.height > 0);
     }
 }

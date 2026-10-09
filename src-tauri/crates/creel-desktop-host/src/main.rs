@@ -85,6 +85,12 @@ fn parse_options(args: impl IntoIterator<Item = std::ffi::OsString>) -> Result<O
 }
 
 #[cfg(windows)]
+mod shell_open;
+
+#[cfg(windows)]
+mod shell_visuals;
+
+#[cfg(windows)]
 mod windows_ipc_host;
 
 #[cfg(windows)]

@@ -1,18 +1,20 @@
 {
   "name": "dcreel",
   "private": true,
-  "version": "0.1.3",
+  "version": "0.1.4",
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "test": "vitest run",
+    "test:native-runtime": "node --test scripts/tests/native-runtime.cjs",
     "build:native": "cargo build --manifest-path src-tauri/Cargo.toml -p creel-shell --lib && cargo build --manifest-path src-tauri/Cargo.toml -p creel-desktop-host",
     "build:native:release": "cargo build --release --manifest-path src-tauri/Cargo.toml -p creel-shell --lib && cargo build --release --manifest-path src-tauri/Cargo.toml -p creel-desktop-host",
     "build:release": "tauri build --no-bundle",
+    "build:test": "tauri build --config src-tauri/tauri.test.conf.json --bundles nsis",
     "tauri:before-dev": "npm run build:native && npm run dev",
-    "tauri:before-build": "npm run build:native:release && npm run build",
+    "tauri:before-build": "npm run build:native:release && node scripts/check-native-runtime.mjs && npm run build",
     "preview": "vite preview",
     "tauri": "tauri",
     "icons": "node scripts/make-icons.mjs && tauri icon src-tauri/icons/creel-icon.png"

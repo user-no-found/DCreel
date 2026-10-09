@@ -535,6 +535,15 @@ mod platform {
                     );
                     continue;
                 }
+                if let Ok(HostEvent::BrokenShortcut { path, message }) = &event {
+                    let _ = callback_app.emit("creel://notification", message.clone());
+                    desktop_notifications::show_broken_shortcut(
+                        &callback_app,
+                        path.clone(),
+                        message.clone(),
+                    );
+                    continue;
+                }
                 if let Ok(HostEvent::DesktopVisibilityChanged { visible }) = &event {
                     if let Some(store) = callback_app.try_state::<AppStore>() {
                         store.set_desktop_visible(*visible);

@@ -1,16 +1,20 @@
 //! Real WebView2 + HWND regression test. No desktop host, shell registration,
-//! tray, autostart, updater or file operations are started by this fixture.
+//! tray, autostart or updater is started. Shortcut actions use isolated temporary fixtures.
 //! Run after `npm run build` on Windows:
 //! cargo test --manifest-path src-tauri/Cargo.toml --features tauri/custom-protocol \
 //!   --lib native_progress_window_lifecycle -- --ignored --nocapture --test-threads=1
 
 use super::*;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use tauri::{WebviewWindow, WebviewWindowBuilder};
-use windows::Win32::{
-    Foundation::{HWND, RECT},
-    UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowRect, IsWindowVisible},
-};
+use tauri::WebviewWindowBuilder;
+
+#[path = "file_transfer_window_test/notifications.rs"]
+mod notifications;
+#[path = "file_transfer_window_test/shortcut_notifications.rs"]
+mod shortcut_notifications;
+#[path = "file_transfer_window_test/support.rs"]
+mod support;
+use support::*;
 
 struct FixtureState {
     fail_dashboard: AtomicBool,
@@ -49,62 +53,6 @@ fn load_dashboard(
     })
 }
 
-fn assert_separate(a: &WebviewWindow, b: &WebviewWindow) {
-    let rect = |window: &WebviewWindow| {
-        let mut rect = RECT::default();
-        unsafe { GetWindowRect(HWND(window.hwnd().unwrap().0), &mut rect) }.unwrap();
-        rect
-    };
-    let (a, b) = (rect(a), rect(b));
-    assert!(
-        a.right <= b.left || b.right <= a.left || a.bottom <= b.top || b.bottom <= a.top,
-        "popup HWND rectangles overlap: {a:?}, {b:?}"
-    );
-}
-
-fn notification_id(app: &AppHandle) -> String {
-    desktop_notifications::current_desktop_notification(app.state())
-        .unwrap()
-        .unwrap()
-        .id
-}
-
-fn visible(window: &WebviewWindow) -> bool {
-    let hwnd = HWND(window.hwnd().unwrap().0);
-    unsafe { IsWindowVisible(hwnd).as_bool() }
-}
-
-fn wait_for(description: &str, timeout: Duration, mut condition: impl FnMut() -> bool) {
-    let deadline = Instant::now() + timeout;
-    while !condition() {
-        assert!(Instant::now() < deadline, "timed out: {description}");
-        thread::sleep(Duration::from_millis(30));
-    }
-}
-
-fn javascript(window: &WebviewWindow, script: &str) -> serde_json::Value {
-    let (sender, receiver) = mpsc::channel();
-    window
-        .eval_with_callback(script, move |result| {
-            let _ = sender.send(result);
-        })
-        .unwrap();
-    let result = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
-    serde_json::from_str(&result).unwrap_or(serde_json::Value::Null)
-}
-
-fn on_ui(app: &AppHandle, action: impl FnOnce() + Send + 'static) {
-    let (sender, receiver) = mpsc::channel();
-    app.run_on_main_thread(move || {
-        let result = catch_unwind(AssertUnwindSafe(action));
-        let _ = sender.send(result);
-    })
-    .unwrap();
-    if let Err(error) = receiver.recv_timeout(Duration::from_secs(5)).unwrap() {
-        std::panic::resume_unwind(error);
-    }
-}
-
 fn begin(app: &AppHandle, state: &Arc<Mutex<TransferState>>, id: &str) {
     let mut snapshot = TransferSnapshot::queued(id.into(), "窗口回归测试（不移动文件）".into());
     snapshot.phase = "moving";
@@ -125,19 +73,6 @@ fn finish(app: &AppHandle, state: &Arc<Mutex<TransferState>>, phase: &'static st
     snapshot.completed_items = snapshot.total_items;
     let id = snapshot.id.clone();
     finish_with_snapshot(app, state, &id, snapshot);
-}
-
-fn show(app: &AppHandle) {
-    let ui_app = app.clone();
-    on_ui(app, move || {
-        let foreground = unsafe { GetForegroundWindow() };
-        desktop_notifications::show_transfer_progress(&ui_app);
-        assert_eq!(
-            unsafe { GetForegroundWindow() },
-            foreground,
-            "show stole foreground focus"
-        );
-    });
 }
 
 fn exercise(app: &AppHandle, state: &Arc<Mutex<TransferState>>) {
@@ -252,109 +187,8 @@ fn exercise(app: &AppHandle, state: &Arc<Mutex<TransferState>>) {
     );
     println!("PASS: old task timeout cannot hide a new active transfer");
 
-    desktop_notifications::show_message(app, "窗口测试", "不会移动文件");
-    wait_for("notification close button", Duration::from_secs(5), || {
-        javascript(
-            &notification,
-            "!!document.querySelector('.desktop-notification-close')",
-        ) == true
-    });
-    wait_for(
-        "render acknowledgement shows notification",
-        Duration::from_secs(3),
-        || visible(&notification),
-    );
-    assert!(visible(&notification));
-    assert_separate(&window, &notification);
-    javascript(
-        &notification,
-        "document.querySelector('.desktop-notification-close').click()",
-    );
-    wait_for(
-        "notification close hides HWND",
-        Duration::from_secs(2),
-        || !visible(&notification),
-    );
-    println!("PASS: notification close button -> IPC -> native hide");
-
-    let ui_window = window.clone();
-    on_ui(app, move || {
-        crate::dismiss_auxiliary_window(ui_window, None).unwrap()
-    });
-    desktop_notifications::show_message(app, "通知先出现", "测试反向排列");
-    wait_for("notification first", Duration::from_secs(3), || {
-        visible(&notification)
-    });
-    let old_id = notification_id(app);
-    show(app);
-    assert_separate(&window, &notification);
-    println!("PASS: both popup creation orders use non-overlapping HWND rectangles");
-
-    desktop_notifications::show_update(app, "window-test".into());
-    wait_for(
-        "replacement update rendered",
-        Duration::from_secs(3),
-        || {
-            visible(&notification)
-                && javascript(
-                    &notification,
-                    "document.body.textContent.includes('window-test')",
-                ) == true
-        },
-    );
-    let ui_window = notification.clone();
-    on_ui(app, move || {
-        crate::dismiss_auxiliary_window(ui_window, Some(old_id)).unwrap()
-    });
-    assert!(
-        visible(&notification),
-        "stale close hid replacement notification"
-    );
-    thread::sleep(Duration::from_millis(9_200));
-    assert!(
-        visible(&notification),
-        "old notification timeout hid persistent update"
-    );
-    notification.reload().unwrap();
-    wait_for(
-        "notification restored after page reload",
-        Duration::from_secs(5),
-        || {
-            visible(&notification)
-                && javascript(
-                    &notification,
-                    "document.body.textContent.includes('window-test')",
-                ) == true
-        },
-    );
-    notification.close().unwrap();
-    wait_for("native notification close", Duration::from_secs(2), || {
-        !visible(&notification)
-    });
-    assert!(app.get_webview_window("desktop-notification").is_some());
-    println!(
-        "PASS: stale manual/timeout close ignored; update persists; reload and native close work"
-    );
-
-    desktop_notifications::show_message(app, "自动收起测试", "由后端计时，不依赖前端定时器");
-    wait_for("timed notification shown", Duration::from_secs(3), || {
-        visible(&notification)
-    });
-    let started = Instant::now();
-    thread::sleep(Duration::from_secs(8));
-    assert!(
-        visible(&notification),
-        "ordinary notification closed too early"
-    );
-    wait_for(
-        "native 9-second notification dismissal",
-        Duration::from_secs(3),
-        || !visible(&notification),
-    );
-    println!(
-        "PASS: notification auto-dismissed HWND after {:?}",
-        started.elapsed()
-    );
+    notifications::exercise(app, &window);
+    shortcut_notifications::exercise(app);
 
     let new_box = app.get_webview_window("new-box").unwrap();
     let ui_app = app.clone();
@@ -454,15 +288,19 @@ fn native_progress_window_lifecycle() {
             desktop_notifications::current_desktop_notification,
             desktop_notifications::subscribe_desktop_notifications,
             desktop_notifications::present_desktop_notification,
+            desktop_notifications::delete_notification_shortcut,
             backend_ready,
             load_dashboard,
             crate::take_pending_navigation,
         ])
         .setup(move |app| {
             for config in configs {
-                WebviewWindowBuilder::from_config(app, &config)?
+                let window = WebviewWindowBuilder::from_config(app, &config)?
                     .data_directory(probe_directory.join(&config.label))
                     .build()?;
+                // JS exercises real click handlers/IPC, while physical mouse
+                // input passes through these test popups to the user's apps.
+                window.set_ignore_cursor_events(true)?;
             }
             desktop_notifications::show_message(
                 app.handle(),

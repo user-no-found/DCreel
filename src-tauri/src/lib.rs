@@ -510,6 +510,7 @@ pub fn run() {
             desktop_notifications::current_desktop_notification,
             desktop_notifications::subscribe_desktop_notifications,
             desktop_notifications::present_desktop_notification,
+            desktop_notifications::delete_notification_shortcut,
             file_transfers::cancel_file_transfer,
             file_transfers::current_file_transfer,
         ]);

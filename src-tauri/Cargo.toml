@@ -1,6 +1,6 @@
 [package]
 name = "dcreel"
-version = "0.1.3"
+version = "0.1.4"
 description = "DCreel - a calm, local-first desktop organizer"
 authors = ["DCreel contributors"]
 edition = "2024"
@@ -13,6 +13,7 @@ members = [
   "crates/creel-ipc",
   "crates/creel-shell",
   "crates/creel-desktop-host",
+  "crates/creel-shell-operations",
 ]
 resolver = "2"
 
@@ -42,6 +43,7 @@ thiserror = "2.0.20"
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(windows)'.dependencies]
+creel-shell-operations = { path = "crates/creel-shell-operations" }
 windows = { version = "0.62.2", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",

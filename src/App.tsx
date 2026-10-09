@@ -1,7 +1,6 @@
 import {
   useCallback,
   useEffect,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -9,7 +8,6 @@ import {
   type KeyboardEvent
 } from "react";
 import {
-  AlertCircle,
   AppWindow,
   Bell,
   Boxes,
@@ -47,7 +45,6 @@ import {
   X
 } from "lucide-react";
 import { getVersion } from "@tauri-apps/api/app";
-import { flushSync } from "react-dom";
 import { open } from "@tauri-apps/plugin-dialog";
 import { check, type DownloadEvent, type Update } from "@tauri-apps/plugin-updater";
 import { listen } from "@tauri-apps/api/event";
@@ -58,8 +55,6 @@ import {
   cancelFileTransfer,
   completeStartup,
   currentFileTransfer,
-  subscribeDesktopNotifications,
-  presentDesktopNotification,
   dismissAuxiliaryWindow,
   deleteFence,
   isTauri,
@@ -71,10 +66,8 @@ import {
   quitApplication,
   saveFence,
   savePreferences,
-  ignoreUpdateVersion,
   setDesktopVisibility,
   setHotkeyCaptureActive,
-  showUpdateDetails,
   showUpdateNotification,
   takePendingNavigation,
   waitForBackendReady,
@@ -82,10 +75,10 @@ import {
 } from "./lib/bridge";
 import { basename, formatBytes } from "./lib/format";
 import { clearMatchingPatch, mergeDashboardWithOptimistic } from "./lib/stateSync";
+import { DesktopNotificationWindow } from "./components/DesktopNotificationWindow";
 import { WindowStartup } from "./components/WindowStartup";
 import type {
   Dashboard,
-  DesktopNotificationPayload,
   Fence,
   FencePatch,
   Preferences,
@@ -165,70 +158,6 @@ function SplashScreen() {
     <div className="splash-screen" role="status" aria-label="DCreel 正在启动">
       <div className="splash-spinner" />
     </div>
-  );
-}
-
-function DesktopNotificationWindow() {
-  const [notification, setNotification] = useState<DesktopNotificationPayload | null>(null);
-
-  useLayoutEffect(() => {
-    let disposed = false;
-    void subscribeDesktopNotifications((payload) => {
-      if (disposed) return;
-      flushSync(() => setNotification(payload));
-    }).catch((error) => {
-      void writeFrontendLog("error", `通知监听失败：${errorMessage(error)}`, "notification").catch(() => undefined);
-    });
-    return () => { disposed = true; };
-  }, []);
-
-  useLayoutEffect(() => {
-    // Hidden WebViews can postpone paint/passive effects. A layout effect runs
-    // immediately after the DOM commit, without requiring the window to show first.
-    if (notification) void presentDesktopNotification(notification.id).catch(() => undefined);
-  }, [notification?.id]);
-
-  if (!notification) return null;
-  const isUpdate = notification.kind === "update" && Boolean(notification.version);
-  return (
-    <section className="desktop-notification" role="status" aria-live="polite">
-      <div className={`desktop-notification-icon ${isUpdate ? "update" : "warning"}`}>
-        {isUpdate ? <Download /> : <AlertCircle />}
-      </div>
-      <div className="desktop-notification-copy">
-        <b>{notification.title}</b>
-        <p>{notification.message}</p>
-        {isUpdate && (
-          <div className="desktop-notification-actions">
-            <button
-              className="notification-primary"
-              onClick={() => void showUpdateDetails(notification.id).catch(() => undefined)}
-            >
-              查看更新
-            </button>
-            <button
-              onClick={() => {
-                const version = notification.version;
-                if (!version) return;
-                void ignoreUpdateVersion(version)
-                  .then(() => dismissAuxiliaryWindow(notification.id))
-                  .catch(() => undefined);
-              }}
-            >
-              不再提醒此版本
-            </button>
-          </div>
-        )}
-      </div>
-      <button
-        className="desktop-notification-close"
-        aria-label="关闭通知"
-        title="关闭通知"
-        onClick={() => void dismissAuxiliaryWindow(notification.id).catch(() => undefined)}
-      >
-        <X />
-      </button>
-    </section>
   );
 }
 

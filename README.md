@@ -105,6 +105,14 @@ npm run tauri build
 
 生成结果位于 `src-tauri/target/release/bundle/`。当前 `tauri.conf.json` 的安装包目标是 NSIS；WiX 语言配置仅在以后显式启用 MSI 目标时使用。
 
+本地测试安装包使用以下命令。它保留正式应用的配置和安装位置，只关闭更新签名产物的生成，不需要发布用的私钥，也不会上传安装包：
+
+```bash
+npm run build:test
+```
+
+Windows MSVC 构建通过项目根目录 `.cargo/config.toml` 静态链接 C 运行库；打包前会检查 Desktop Host 和 Shell DLL 的实际导入表，发现外部 VC++ 运行库依赖时立即停止构建。
+
 ## 常用检查
 
 ```bash
@@ -113,6 +121,9 @@ npm run build
 
 # 前端状态同步测试
 npm test
+
+# 原生组件运行库依赖检查的回归测试
+npm run test:native-runtime
 
 # Rust 编译检查
 cargo check --workspace --manifest-path src-tauri/Cargo.toml
@@ -171,6 +182,10 @@ Tauri 通过系统应用配置目录保存数据。Windows 默认位置为：
 
 这里只保存设置、盒子映射路径和布局，不保存文件内容。状态更新通过同目录临时文件原子替换，`state.backup.json` 保留上一份完整配置；主配置损坏时会先保留为 `state.invalid.*.json`，再从备份恢复。设置页不展示配置路径入口。
 
+Windows 映射路径可能采用 `\\?\` 扩展路径格式。目录读取和目录身份找回使用保存的原路径；调用 Shell 获取图标、打开项目或执行右键菜单操作时会另行转换路径参数，不改写映射状态。
+
+失效快捷方式的打开提示提供“删除快捷方式”按钮。后端按通知编号定位文件，重新确认目标仍不可用后将 `.lnk` 本身移入回收站；目标恢复、旧通知或普通错误提示不能执行此操作。通知原有的关闭按钮、原生关闭、9 秒自动收起和替换保护继续生效。
+
 ## 工程结构
 
 ```text
@@ -194,6 +209,7 @@ src-tauri/
   icons/               多平台应用图标
   crates/creel-ipc/    外部命令及 Desktop Host 共享的版本化 JSON Lines 协议
   crates/creel-shell/  纯 Rust cdylib：Explorer IExplorerCommand、类工厂和 COM 探针
+  crates/creel-shell-operations/  Windows Shell 路径转换、快捷方式目标检查和回收站操作
   crates/creel-desktop-host/  进程外纯 Rust Win32 桌面渲染宿主、IPC 多窗口模式与探针
 
 scripts/

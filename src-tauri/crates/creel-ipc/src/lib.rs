@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-pub const PROTOCOL_VERSION: u16 = 15;
+pub const PROTOCOL_VERSION: u16 = 16;
 pub const ARG_SHOW: &str = "--show";
 pub const ARG_SILENT: &str = "--silent";
 pub const ARG_NEW_FENCE: &str = "--new-fence";
@@ -204,6 +204,10 @@ pub enum HostEvent {
         action: HostUserAction,
     },
     Notification {
+        message: String,
+    },
+    BrokenShortcut {
+        path: PathBuf,
         message: String,
     },
     DesktopVisibilityChanged {

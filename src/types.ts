@@ -95,6 +95,7 @@ export interface DesktopNotificationPayload {
   title: string;
   message: string;
   version?: string;
+  action?: "deleteShortcut";
 }
 
 export interface Dashboard {

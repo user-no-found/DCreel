@@ -13,6 +13,7 @@ log = "0.4.34"
 serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
+creel-shell-operations = { path = "../creel-shell-operations" }
 windows = { version = "0.62.2", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",

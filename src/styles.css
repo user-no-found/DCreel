@@ -1761,6 +1761,42 @@ input:focus-visible {
   border-color: #ad4c3a;
 }
 
+.desktop-notification.has-shortcut-action {
+  grid-template-rows: minmax(0, 1fr);
+}
+
+.has-shortcut-action .desktop-notification-copy {
+  height: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.has-shortcut-action .desktop-notification-copy > b,
+.has-shortcut-action .desktop-notification-actions {
+  flex-shrink: 0;
+}
+
+.has-shortcut-action .desktop-notification-copy > p {
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.has-shortcut-action .desktop-notification-message {
+  flex: 1;
+}
+
+.has-shortcut-action .desktop-notification-copy > .notification-action-error {
+  flex-shrink: 0;
+  max-height: 30px;
+  color: #bf5945;
+}
+
+.has-shortcut-action .desktop-notification-actions button:disabled {
+  opacity: 0.65;
+  cursor: wait;
+}
+
 .transfer-window {
   display: flex;
   flex-direction: column;

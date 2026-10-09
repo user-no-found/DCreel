@@ -299,3 +299,7 @@ export async function presentDesktopNotification(id: string): Promise<void> {
   if (!isTauri()) return;
   await invokeLogged("present_desktop_notification", { id });
 }
+
+export async function deleteNotificationShortcut(id: string): Promise<void> {
+  await invokeLogged("delete_notification_shortcut", { id });
+}

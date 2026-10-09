@@ -31,6 +31,18 @@ jobs:
 
       - run: npm ci
 
+      - name: Test native runtime package checks
+        run: npm run test:native-runtime
+
+      - name: Test Windows Shell and desktop host
+        run: cargo test --locked --release --manifest-path src-tauri/Cargo.toml -p creel-desktop-host --bin creel-desktop-host
+
+      - name: Test Windows shortcut recycling
+        run: cargo test --locked --release --manifest-path src-tauri/Cargo.toml -p creel-shell-operations
+
+      - name: Test notification action and dismissal guards
+        run: cargo test --locked --release --manifest-path src-tauri/Cargo.toml -p dcreel --lib --features tauri/custom-protocol desktop_notifications
+
       - name: Read release notes from tag
         id: release_notes
         shell: pwsh
