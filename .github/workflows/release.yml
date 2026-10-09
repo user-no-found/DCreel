@@ -40,6 +40,9 @@ jobs:
       - name: Test Windows shortcut recycling
         run: cargo test --locked --release --manifest-path src-tauri/Cargo.toml -p creel-shell-operations
 
+      - name: Prepare resources for backend tests
+        run: npm run tauri:before-build
+
       - name: Test notification action and dismissal guards
         run: cargo test --locked --release --manifest-path src-tauri/Cargo.toml -p dcreel --lib --features tauri/custom-protocol desktop_notifications
 
